@@ -59,6 +59,18 @@ bitflags! {
         const GLOBAL =          1 << 8;
         const COPY_ON_WRITE =   1 << 9; // Use this field to mark CoW pages
 
+        /* ========== [MPK-DEV] MPK pkey 位定义 - 开始 ========== */
+        /*
+         * x86-64 页表项 (PTE) bits 62:59 用于存储 MPK Protection Key。
+         * 必须在 bitflags! 中显式定义这些位，否则 from_bits_truncate()
+         * 会将它们截断为 0，导致 pkey 无法正确写入页表。
+         */
+        const PKEY_BIT0 =       1 << 59;
+        const PKEY_BIT1 =       1 << 60;
+        const PKEY_BIT2 =       1 << 61;
+        const PKEY_BIT3 =       1 << 62;
+        /* ========== [MPK-DEV] MPK pkey 位定义 - 结束 ========== */
+
         const NO_EXECUTE =      1 << 63;
 
         // Special value that indicates to use the flag in the existing entry
@@ -97,6 +109,82 @@ impl ProcessPageFlags {
         Self::PRESENT | Self::NO_EXECUTE | Self::ACCESSED |
         Self::DIRTY | Self::USER_ACCESSIBLE
     }
+
+    /* ========== [MPK-DEV] MPK pkey 页标志支持 - 开始 ========== */
+    
+    /// 创建带 pkey 的数据页标志
+    /// 
+    /// ## 功能
+    /// 
+    /// 基于 `data()` 标志，在页表项中设置 MPK pkey 位。
+    /// 用于为不同的 WASM 函数模块分配带有独立 pkey 标记的内存。
+    /// 
+    /// ## 参数
+    /// 
+    /// - `pkey`: MPK 保护密钥 (0-15)
+    /// 
+    /// ## 返回值
+    /// 
+    /// 带有 pkey 标记的页标志，包含：
+    /// - PRESENT: 页存在
+    /// - GLOBAL: 全局页
+    /// - WRITABLE: 可写
+    /// - NO_EXECUTE: 不可执行
+    /// - ACCESSED: 已访问
+    /// - DIRTY: 已修改
+    /// - USER_ACCESSIBLE: 用户可访问
+    /// - pkey bits (62:59): MPK 保护密钥
+    /// 
+    /// ## x86-64 页表项中的 pkey 位置
+    /// 
+    /// 在 x86-64 架构中，页表项 (PTE) 的 bits 62:59 用于存储 Protection Key：
+    /// 
+    /// ```text
+    /// 63    62  59 58                                      12 11        0
+    /// +-----+------+----------------------------------------+-----------+
+    /// | NX  | pkey |           Physical Address             |   Flags   |
+    /// +-----+------+----------------------------------------+-----------+
+    ///        ^^^^
+    ///        4-bit pkey (0-15)
+    /// ```
+    /// 
+    /// ## 示例
+    /// 
+    /// ```rust
+    /// let flags = ProcessPageFlags::data_with_pkey(1);
+    /// // flags 包含 data() 的所有标志 + pkey 1 在 bits 62:59
+    /// ```
+    pub fn data_with_pkey(pkey: u32) -> Self {
+        // 将 pkey 值 (0-15) 移动到 bits 62:59 的位置
+        // & 0xF 确保只取低 4 位，防止越界
+        // << 59 将 pkey 移动到正确的位置
+        let pkey_bits = ((pkey as u64) & 0xF) << 59;
+        
+        // 将 pkey bits 与 data() 标志合并
+        // from_bits_truncate() 从原始位创建标志，忽略未定义的位
+        Self::from_bits_truncate(Self::data().bits() | pkey_bits)
+    }
+    
+    /// 从页标志中提取 pkey 值（调试用）
+    /// 
+    /// ## 返回值
+    /// 
+    /// 页标志中存储的 pkey 值 (0-15)
+    #[allow(dead_code)]
+    pub fn get_pkey(&self) -> u32 {
+        // 从 bits 62:59 提取 pkey
+        // >> 59 将 pkey 移动到最低位
+        // & 0xF 只取低 4 位
+        ((self.bits() >> 59) & 0xF) as u32
+    }
+    
+    /* ========== [MPK-DEV] MPK pkey 页标志支持 - 结束 ========== */
+
+    /* ========== [MPK-DEV] MPK pkey 掩码常量 - 开始 ========== */
+    /// PTE 中 pkey 位的掩码 (bits 62:59)
+    /// 用于 clear_pkey 操作时清除 pkey 标记
+    const PKEY_MASK: u64 = 0xFu64 << 59;
+    /* ========== [MPK-DEV] MPK pkey 掩码常量 - 结束 ========== */
 }
 
 #[repr(C)]
@@ -793,6 +881,40 @@ impl ProcessPageTableRef {
         }
     }
 
+    /* ========== [MPK-DEV] 六接口新增：clear_pkey 页表操作 - 开始 ========== */
+
+    /// 清除页表项中的 pkey 标记
+    ///
+    /// 参考 `change_attr()` 的 page_walk + PTE 操作模式。
+    /// 将指定虚拟地址对应的 PTE 中 bits 62:59 (pkey) 清零，
+    /// 保留其他所有属性（PRESENT, WRITABLE, NX 等）不变。
+    ///
+    /// ## 参数
+    ///
+    /// - `vaddr`: 要清除 pkey 的虚拟地址（必须页对齐）
+    ///
+    /// ## 说明
+    ///
+    /// 此函数在 mpk_free_memory() 中被逐页调用，
+    /// 在释放物理页之前先清除 pkey 标记，确保页表干净。
+    /// 如果页不存在（未映射），则静默跳过。
+    pub fn clear_pkey(&self, vaddr: VirtAddr) {
+        let (_pgd_mapping, pgd_table) = paddr_as_table!(self.process_page_table);
+        let current_mapping = self.page_walk(&pgd_table, self.process_page_table, vaddr);
+
+        match current_mapping {
+            ProcessTableLevelMapping::PTE(addr, index) => {
+                let (_mapping, table) = paddr_as_u64_slice!(addr);
+                // 清除 bits 62:59 (pkey)，保留其他所有属性
+                table[index] &= !ProcessPageFlags::PKEY_MASK;
+            }
+            _ => {
+                // 页不存在，跳过
+            }
+        }
+    }
+
+    /* ========== [MPK-DEV] 六接口新增：clear_pkey 页表操作 - 结束 ========== */
 
     /// Takes the page table of the guest OS and copies the
     /// specified starteding from addr and edning at addr + size * pagesize

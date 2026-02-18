@@ -20,6 +20,14 @@ use crate::sev::rmp_adjust;
 use crate::process_manager::process_memory::{PGD, addr_to_idx};
 use crate::process_manager::memory_channels::{INPUT_VADDR, OUTPUT_VADDR};
 
+// [MPK-DEV] MPK 六接口内存管理模块导入
+use crate::process_manager::mpk_memory::{
+    mpk_pkey_alloc_only,    // 接口1: 仅分配 pkey
+    mpk_alloc_memory,       // 接口2: 分配带 pkey 的内存
+    mpk_free_memory,        // 接口5: 仅释放内存（不释放 pkey）
+    mpk_free_pkey,          // 接口6: 释放 pkey（可选同时释放内存）
+};
+
 #[cfg(feature = "stat")]
 use core::sync::atomic;
 
@@ -47,6 +55,15 @@ pub trait ProcessRuntime {
     fn pal_svsm_inflate_channel(&mut self) -> bool;
     fn pal_nop(&mut self) -> bool;
     fn pal_svsm_finalize(&mut self) -> bool;
+    
+    // [MPK-DEV] MPK 六接口 trait 方法
+    fn pal_svsm_mpk_pkey_alloc(&mut self) -> bool;     // 接口1: 仅分配 pkey (0x4FFFFFF1)
+    fn pal_svsm_mpk_alloc(&mut self) -> bool;          // 接口2: 分配带 pkey 的内存 (0x4FFFFFF3)
+    fn pal_svsm_mpk_enter_domain(&mut self) -> bool;   // 接口3: 进入安全域 (0x4FFFFFF0)
+    fn pal_svsm_mpk_exit_domain(&mut self) -> bool;    // 接口4: 退出安全域 (0x4FFFFFEF)
+    fn pal_svsm_mpk_free(&mut self) -> bool;           // 接口5: 释放内存 (0x4FFFFFF2)
+    fn pal_svsm_mpk_free_pkey(&mut self) -> bool;      // 接口6: 释放 pkey (0x4FFFFFEE)
+    fn pal_svsm_mpk_query_pkru(&mut self) -> bool;     // 辅助: 查询 PKRU (0x4FFFFFED)
 }
 
 /// Invocation type of invokeTrustlet
@@ -453,6 +470,14 @@ impl ProcessRuntime for PALContext  {
             0x4FFFFFF4 => {
                 return self.pal_svsm_finalize();
             }
+            // [MPK-DEV] MPK 六接口 CPUID 调用号分发
+            0x4FFFFFF3 => { return self.pal_svsm_mpk_alloc(); }          // 接口2: 分配带 pkey 的内存
+            0x4FFFFFF2 => { return self.pal_svsm_mpk_free(); }           // 接口5: 释放内存
+            0x4FFFFFF1 => { return self.pal_svsm_mpk_pkey_alloc(); }     // 接口1: 仅分配 pkey
+            0x4FFFFFF0 => { return self.pal_svsm_mpk_enter_domain(); }   // 接口3: 进入安全域
+            0x4FFFFFEF => { return self.pal_svsm_mpk_exit_domain(); }    // 接口4: 退出安全域
+            0x4FFFFFEE => { return self.pal_svsm_mpk_free_pkey(); }      // 接口6: 释放 pkey
+            0x4FFFFFED => { return self.pal_svsm_mpk_query_pkru(); }     // 辅助: 查询 PKRU
             // monitor calls (other)
             0x4EFFFFFF => {
                 return self.handle_exception();
@@ -545,6 +570,189 @@ impl ProcessRuntime for PALContext  {
         }
         return true;
     }
+
+    /* ========== [MPK-DEV] MPK 六接口处理函数 - 开始 ========== */
+
+    /// 接口1: 仅分配 pkey（不分配内存）
+    ///
+    /// 寄存器: rax=0x4FFFFFF1
+    /// 返回: rax=pkey(1-15), rcx=0/错误码(6=无空闲pkey)
+    fn pal_svsm_mpk_pkey_alloc(&mut self) -> bool {
+        match mpk_pkey_alloc_only() {
+            Ok(pkey) => {
+                self.vmsa.rax = pkey as u64;
+                self.vmsa.rcx = 0;
+                log::info!("[MPK] pkey_alloc: pkey={}", pkey);
+            }
+            Err(e) => {
+                self.vmsa.rcx = e as u64;
+                log::error!("[MPK] pkey_alloc failed: error={}", e);
+            }
+        }
+        true
+    }
+
+    /// 接口2: 分配带 pkey 标记的内存
+    ///
+    /// 寄存器: rax=0x4FFFFFF3, rbx=vaddr, rcx=size, rdx=pkey
+    /// 返回: rcx=0/错误码(1=未对齐, 3=地址已用)
+    fn pal_svsm_mpk_alloc(&mut self) -> bool {
+        let addr = self.vmsa.rbx;
+        let size = self.vmsa.rcx;
+        let pkey = self.vmsa.rdx as u32;
+        let page_table_cr3 = self.vmsa.cr3;
+
+        // 页对齐检查
+        if addr % 4096 != 0 || size % 4096 != 0 {
+            self.vmsa.rcx = 1;
+            log::error!("[MPK] alloc failed: addr={:#x}, size={} - not page aligned", addr, size);
+            return true;
+        }
+
+        match mpk_alloc_memory(page_table_cr3, addr, size, pkey) {
+            Ok(()) => {
+                self.vmsa.rcx = 0;
+                log::info!("[MPK] alloc success: addr={:#x}, size={}, pkey={}", addr, size, pkey);
+            }
+            Err(e) => {
+                self.vmsa.rcx = e as u64;
+                log::error!("[MPK] alloc failed: addr={:#x}, size={}, pkey={}, error={}", addr, size, pkey, e);
+            }
+        }
+        true
+    }
+
+    /// 接口3: 进入安全域（打开 PKRU 中 pkey 的读写权限）
+    ///
+    /// 寄存器: rax=0x4FFFFFF0, rbx=pkey
+    /// 返回: rcx=0/错误码(7=无效pkey, 8=安全策略拒绝)
+    ///
+    /// 安全策略: 除 pkey 0 外，同一时刻只允许一个 pkey 权限处于打开状态。
+    fn pal_svsm_mpk_enter_domain(&mut self) -> bool {
+        let pkey = self.vmsa.rbx as u32;
+        // 注意: VMSA 是 packed struct，需先拷贝到局部变量
+        let pkru = self.vmsa.pkru;
+
+        if pkey == 0 || pkey > 15 {
+            self.vmsa.rcx = 7;
+            log::error!("[MPK] enter_domain: invalid pkey={}", pkey);
+            return true;
+        }
+
+        // 安全策略: 检查是否有其他 pkey (1-15) 的权限已打开
+        // PKRU 每个 pkey 占 2 bit: bit0=AD, bit1=WD; 权限打开 = 两位都为 0
+        for other in 1..16u32 {
+            if other == pkey { continue; }
+            if (pkru >> (other * 2)) & 0x3 == 0 {
+                self.vmsa.rcx = 8;
+                log::warn!("[MPK] enter_domain rejected: pkey={}, other_pkey={} already open, PKRU={:#x}",
+                           pkey, other, pkru);
+                return true;
+            }
+        }
+
+        // 打开权限: 将对应 2 bit 清零 (AD=0, WD=0)
+        let new_pkru = pkru & !(0x3u32 << (pkey * 2));
+        self.vmsa.pkru = new_pkru;
+        self.vmsa.rcx = 0;
+        log::info!("[MPK] enter_domain: pkey={}, PKRU {:#x} -> {:#x}", pkey, pkru, new_pkru);
+        true
+    }
+
+    /// 接口4: 退出安全域（关闭 PKRU 中 pkey 的权限）
+    ///
+    /// 寄存器: rax=0x4FFFFFEF, rbx=pkey
+    /// 返回: rcx=0/错误码(7=无效pkey)
+    fn pal_svsm_mpk_exit_domain(&mut self) -> bool {
+        let pkey = self.vmsa.rbx as u32;
+        let pkru = self.vmsa.pkru;
+
+        if pkey == 0 || pkey > 15 {
+            self.vmsa.rcx = 7;
+            log::error!("[MPK] exit_domain: invalid pkey={}", pkey);
+            return true;
+        }
+
+        // 关闭权限: 设置 AD=1 (禁止访问)
+        let new_pkru = pkru | (0x1u32 << (pkey * 2));
+        self.vmsa.pkru = new_pkru;
+        self.vmsa.rcx = 0;
+        log::info!("[MPK] exit_domain: pkey={}, PKRU {:#x} -> {:#x}", pkey, pkru, new_pkru);
+        true
+    }
+
+    /// 接口5: 释放内存（仅释放内存，不释放 pkey）
+    ///
+    /// 寄存器: rax=0x4FFFFFF2, rbx=vaddr, rcx=size
+    /// 返回: rcx=0/错误码(1=未对齐, 2=未找到, 4=大小不匹配)
+    fn pal_svsm_mpk_free(&mut self) -> bool {
+        let addr = self.vmsa.rbx;
+        let size = self.vmsa.rcx;
+        let page_table_cr3 = self.vmsa.cr3;
+
+        if addr % 4096 != 0 || size % 4096 != 0 {
+            self.vmsa.rcx = 1;
+            log::error!("[MPK] free_memory failed: addr={:#x}, size={} - not page aligned", addr, size);
+            return true;
+        }
+
+        match mpk_free_memory(page_table_cr3, addr, size) {
+            Ok(_) => {
+                self.vmsa.rcx = 0;
+                log::info!("[MPK] free_memory success: addr={:#x}, size={}", addr, size);
+            }
+            Err(e) => {
+                self.vmsa.rcx = e as u64;
+                log::error!("[MPK] free_memory failed: addr={:#x}, size={}, error={}", addr, size, e);
+            }
+        }
+        true
+    }
+
+    /// 接口6: 释放 pkey（可选同时释放内存）
+    ///
+    /// 寄存器: rax=0x4FFFFFEE, rbx=pkey, rcx=vaddr(0=不释放内存), rdx=size(0=不释放内存)
+    /// 返回: rcx=0/错误码
+    fn pal_svsm_mpk_free_pkey(&mut self) -> bool {
+        let pkey = self.vmsa.rbx as u32;
+        let addr = self.vmsa.rcx;
+        let size = self.vmsa.rdx;
+        let page_table_cr3 = self.vmsa.cr3;
+
+        if addr != 0 && size != 0 {
+            if addr % 4096 != 0 || size % 4096 != 0 {
+                self.vmsa.rcx = 1;
+                log::error!("[MPK] free_pkey: addr={:#x}, size={} - not page aligned", addr, size);
+                return true;
+            }
+        }
+
+        match mpk_free_pkey(pkey, page_table_cr3, addr, size) {
+            Ok(_) => {
+                self.vmsa.rcx = 0;
+                log::info!("[MPK] free_pkey: pkey={}, addr={:#x}, size={}", pkey, addr, size);
+            }
+            Err(e) => {
+                self.vmsa.rcx = e as u64;
+                log::error!("[MPK] free_pkey failed: pkey={}, error={}", pkey, e);
+            }
+        }
+        true
+    }
+
+    /// 辅助: 查询 PKRU 值（调试/测试用）
+    ///
+    /// 寄存器: rax=0x4FFFFFED
+    /// 返回: rax=PKRU值, rcx=0
+    fn pal_svsm_mpk_query_pkru(&mut self) -> bool {
+        let pkru_val = self.vmsa.pkru;
+        self.vmsa.rax = pkru_val as u64;
+        self.vmsa.rcx = 0;
+        log::info!("[MPK] query_pkru: PKRU={:#x}", pkru_val);
+        true
+    }
+
+    /* ========== [MPK-DEV] MPK 六接口处理函数 - 结束 ========== */
 
     /// Handle CPUID instruction from the trustlet
     /// 
@@ -762,6 +970,7 @@ impl ProcessRuntime for PALContext  {
     /// * no return value
     fn pal_svsm_debug_print(&mut self) -> bool {
         let c = self.vmsa.rbx;
+        // 将字符累积到缓冲区
         if self.string_pos < 255{
             self.string_buf[self.string_pos] = c as u8;
             self.string_pos += 1;
@@ -772,6 +981,7 @@ impl ProcessRuntime for PALContext  {
             self.string_pos = 0;
             self.string_buf = [0;256];
         }
+        // 只有收到 '\0' 时才输出
         if c == 0 {
             let debug_string = str::from_utf8(&self.string_buf).unwrap();
             log::info!(" [Trustlet] {}", debug_string);
@@ -1117,6 +1327,35 @@ impl ProcessRuntime for PALContext  {
                 const PF_USER: u64 = 1 << 2;
                 const PF_RESERVED: u64 = 1 << 3;
                 const PF_INSTRUCTION: u64 = 1 << 4;
+
+                /* ========== [MPK-DEV] MPK 违规 #PF 识别 - 开始 ========== */
+                //
+                // x86-64 #PF error code bit 5 (PK) 表示 Protection Key violation。
+                // 当 VMPL-1 中的代码尝试访问一个页表项带有 pkey 标记的内存页，
+                // 而 PKRU 寄存器中对应 pkey 的权限位禁止该访问时，CPU 会触发
+                // #PF 并在 error code 中设置 bit 5。
+                //
+                // 此检查必须在 mmap 查找和 CoW 处理之前执行，因为 MPK 违规
+                // 是一种安全隔离机制，不应被其他 #PF 处理逻辑误处理。
+                //
+                // 当前行为：记录日志并终止 Trustlet（return false）。
+                // 这是预期行为——MPK 隔离违规意味着代码试图越权访问其他
+                // 函数模块的内存，应当被阻止。
+                //
+                const PF_PK: u64 = 1 << 5;
+                if error_code & PF_PK != 0 {
+                    log::info!("[Trustlet] #PF: MPK protection key violation at CR2={:#x}, RIP={:#x}, error_code={:#x}",
+                               cr2, rip, error_code);
+                    // 注意: VMSA 是 packed 结构体，不能直接在宏中引用字段，需先拷贝到局部变量
+                    let pkru_val = self.vmsa.pkru;
+                    let cr4_val = self.vmsa.cr4;
+                    log::info!("[Trustlet] #PF: PKRU={:#x}, CR4={:#x}",
+                               pkru_val, cr4_val);
+                    // MPK 违规不可恢复，终止 Trustlet 执行
+                    return false;
+                }
+                /* ========== [MPK-DEV] MPK 违规 #PF 识别 - 结束 ========== */
+
                 let mmap_manager = &self.process.mmap_manager;
                 log::info!("[Trustlet] #PF: CR2=0x{:x}", cr2);
                 if let Some(mmap_info) = mmap_manager.lookup(cr2 as usize) {

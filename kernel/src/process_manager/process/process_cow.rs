@@ -253,6 +253,38 @@ impl ProcessContext {
         vmsa.rbp = u64::from(TP_STACK_START_VADDR)+8*4096;
         vmsa.rsp = u64::from(TP_STACK_START_VADDR)+8*4096;
 
+        /* ========== [MPK-DEV] 启用 XCR0 PKRU 状态 + 设置 PKRU 初始值 - 开始 ========== */
+        //
+        // === 步骤 1: 在 XCR0 中启用 PKRU 状态保存 (bit 9) ===
+        //
+        // 问题: QEMU CPUID 表未向 Guest 报告 PKU 支持 (CPUID.07H:ECX.PKU=0)，
+        // 导致 Guest Linux 不启用 XCR0 bit 9。Trustlet VMSA 继承 Guest 的
+        // XCR0 = 0x7（只有 x87+SSE+AVX），CPU 在 VMPL 切换时不会加载/保存
+        // PKRU，我们对 vmsa.pkru 的设置完全无效。
+        //
+        // 解决: 强制启用 XCR0 bit 9。这是安全的，因为:
+        //   1. 物理 CPU (AMD EPYC 7713P) 支持 PKU (主机 XCR0 = 0x207)
+        //   2. VMSA 由 VMPL-0 直接控制，不经过 hypervisor 检查
+        //   3. 只影响 Trustlet (VMPL-1) 自己的 XSAVE 状态
+        //
+        vmsa.xcr0 = vmsa.xcr0 | (1u64 << 9);
+        // 注意: VMSA 是 packed 结构体，不能直接在宏中引用字段，需先拷贝到局部变量
+        let xcr0_val = vmsa.xcr0;
+        log::info!("[MPK] VMSA XCR0 PKRU state enabled, XCR0={:#x}", xcr0_val);
+        //
+        // === 步骤 2: 设置 PKRU 初始值 ===
+        //
+        // 新值 0x55555554 的含义（每个 pkey 占 2 bit: AD=Access Disable, WD=Write Disable）:
+        //   - pkey 0:  bits 1:0  = 00 → 允许读写（Wallet 现有内存使用 pkey=0）
+        //   - pkey 1-15: 每个 = 01 → 禁止访问（AD=1）
+        //
+        // 安全性: 现有 Wallet 所有内存页表项 pkey=0，PKRU 中 pkey 0 仍允许读写，
+        // 不影响任何现有功能。Trustlet 通过 *vmsa = *zygote_vmsa 继承此值。
+        //
+        vmsa.pkru = 0x55555554;
+        let pkru_val = vmsa.pkru;
+        log::info!("[MPK] VMSA PKRU initialized to {:#x}", pkru_val);
+        /* ========== [MPK-DEV] 启用 XCR0 PKRU 状态 + 设置 PKRU 初始值 - 结束 ========== */
 
         // Setup exception handlers
 

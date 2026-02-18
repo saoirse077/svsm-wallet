@@ -21,6 +21,10 @@ pub mod memory_channels;
 pub mod outb;
 pub mod exception_handling;
 
+// [MPK-DEV] MPK 内存管理模块
+// 实现 pkey 分配器和 vaddr->pkey 映射，用于 WASM 函数模块的内存隔离
+pub mod mpk_memory;
+
 static MONITOR_INIT_STATE: ImmutAfterInitCell<bool> = ImmutAfterInitCell::new(false);
 const MONITOR_INIT_STATE_TRUE: bool = true;
 pub const PROCESS_STORE_SIZE: u32 = 64;

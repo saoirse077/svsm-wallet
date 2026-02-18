@@ -124,7 +124,7 @@ pub fn init_guest_vmsa(v: &mut VMSA, rip: u64) {
     v.es = real_mode_data_segment();
     v.fs = real_mode_data_segment();
     v.gs = real_mode_data_segment();
-    v.ss = real_mode_data_segment();
+    v.ss = real_mode_data_segment(); 
     v.gdt = real_mode_sys_seg(0);
     v.idt = real_mode_sys_seg(0);
     v.ldt = real_mode_sys_seg(0x82);

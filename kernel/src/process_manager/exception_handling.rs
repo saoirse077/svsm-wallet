@@ -137,6 +137,27 @@ pub fn setup_exceptions(vmsa: &mut VMSA, page_table_ref: &ProcessPageTableRef) {
     // FIXME: propery setup the page flags for the handler
     vmsa.cr4 = vmsa.cr4 & !(1u64 << 20 | 1u64 << 21);
 
+    /* ========== [MPK-DEV] 确保 CR4.PKE 启用 - 开始 ========== */
+    //
+    // 启用 CR4.PKE (Protection Key Enable, bit 22)，使 MPK 保护生效。
+    //
+    // 背景：CR4.PKE 控制 CPU 是否检查页表项中的 pkey 位 (bits 62:59) 和
+    // PKRU 寄存器。当 PKE=0 时，CPU 忽略页表中的 pkey 和 PKRU，MPK 不生效。
+    //
+    // 原始值：继承自 Guest Linux VMSA。Linux 6.8 在 x86-64 上默认启用 PKE
+    // (硬件支持时自动设置)，所以此操作大概率是 no-op。但为了确保 MPK 在
+    // 所有环境下都能正常工作，这里显式设置 bit 22 = 1。
+    //
+    // 安全性：PKE 只控制 PKRU 对页表 pkey 位的检查，不影响其他任何内存
+    // 访问机制（如 RMP、常规页表权限等）。配合 PKRU=0x55555554（pkey 0 允许），
+    // 现有 Wallet 功能完全不受影响。
+    //
+    vmsa.cr4 = vmsa.cr4 | (1u64 << 22);
+    // 注意: VMSA 是 packed 结构体，不能直接在宏中引用字段，需先拷贝到局部变量
+    let cr4_val = vmsa.cr4;
+    log::info!("[MPK] CR4.PKE enabled, CR4={:#x}", cr4_val);
+    /* ========== [MPK-DEV] 确保 CR4.PKE 启用 - 结束 ========== */
+
     log::debug!("asm_entry_trustlet_pf: {:x}", asm_entry_trustlet_pf as u64);
     log::debug!("asm_entry_trustlet_df: {:x}", asm_entry_trustlet_df as u64);
     log::debug!("gdt_desc: {:x}", unsafe { &gdt_desc as *const u8 as u64 });
