@@ -578,15 +578,16 @@ impl ProcessRuntime for PALContext  {
     /// 寄存器: rax=0x4FFFFFF1
     /// 返回: rax=pkey(1-15), rcx=0/错误码(6=无空闲pkey)
     fn pal_svsm_mpk_pkey_alloc(&mut self) -> bool {
-        match mpk_pkey_alloc_only() {
+        let page_table_cr3 = self.vmsa.cr3;
+        match mpk_pkey_alloc_only(page_table_cr3) {
             Ok(pkey) => {
                 self.vmsa.rax = pkey as u64;
                 self.vmsa.rcx = 0;
-                log::info!("[MPK] pkey_alloc: pkey={}", pkey);
+                log::info!("[MPK] pkey_alloc: cr3={:#x}, pkey={}", page_table_cr3, pkey);
             }
             Err(e) => {
                 self.vmsa.rcx = e as u64;
-                log::error!("[MPK] pkey_alloc failed: error={}", e);
+                log::error!("[MPK] pkey_alloc failed: cr3={:#x}, error={}", page_table_cr3, e);
             }
         }
         true
