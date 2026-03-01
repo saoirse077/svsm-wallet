@@ -17,6 +17,7 @@ use crate::vaddr_as_slice;
 use crate::types::PageSize;
 use crate::sev::RMPFlags;
 use crate::sev::rmp_adjust;
+use crate::sev::utils::rmp_set_guest_vmsa;
 use crate::process_manager::process_memory::{PGD, addr_to_idx};
 use crate::process_manager::memory_channels::{INPUT_VADDR, OUTPUT_VADDR};
 
@@ -64,6 +65,11 @@ pub trait ProcessRuntime {
     fn pal_svsm_mpk_free(&mut self) -> bool;           // 接口5: 释放内存 (0x4FFFFFF2)
     fn pal_svsm_mpk_free_pkey(&mut self) -> bool;      // 接口6: 释放 pkey (0x4FFFFFEE)
     fn pal_svsm_mpk_query_pkru(&mut self) -> bool;     // 辅助: 查询 PKRU (0x4FFFFFED)
+
+    // [THREAD] Thread management (same-CPU sequential execution)
+    fn pal_svsm_thread_create(&mut self) -> bool;    // 0x4FFFFFEC
+    fn pal_svsm_thread_join(&mut self) -> bool;      // 0x4FFFFFEB
+    fn pal_svsm_thread_exit(&mut self) -> bool;      // 0x4FFFFFEA
 }
 
 /// Invocation type of invokeTrustlet
@@ -153,6 +159,15 @@ impl MmapManager {
     }
 }
 
+const MAX_THREADS_PER_PROCESS: usize = 8;
+
+#[derive(Debug, Clone, Copy)]
+enum ThreadSlot {
+    Free,
+    Created(PhysAddr),
+    Done(u64),
+}
+
 #[derive(Debug)]
 pub struct PALContext {
     process: &'static mut TrustedProcess,
@@ -165,6 +180,7 @@ pub struct PALContext {
     invocation_arg_guest_vaddr: u64,
     invocation_arg_size: usize,
     return_value: u64,
+    threads: [ThreadSlot; MAX_THREADS_PER_PROCESS],
 }
 
 pub fn early_invoke(zygote: &'static mut TrustedProcess) {
@@ -184,13 +200,13 @@ pub fn early_invoke(zygote: &'static mut TrustedProcess) {
         vmsa,
         string_buf,
         string_pos,
-        // Only required for Trustlet
         result_addr: 0,
         result_size: 0,
         guest_page_table: 0,
         invocation_arg_guest_vaddr: 0,
         invocation_arg_size: 0,
         return_value: 0,
+        threads: [ThreadSlot::Free; MAX_THREADS_PER_PROCESS],
     };
 
     loop {
@@ -345,6 +361,7 @@ pub fn invoke_trustlet(params: &mut RequestParams) -> Result<(), SvsmReqError> {
             invocation_arg_guest_vaddr,
             invocation_arg_size,
             return_value: TrustletReturnType::ERROR as u64,
+            threads: [ThreadSlot::Free; MAX_THREADS_PER_PROCESS],
         };
 
     // Execution loop of the trustlet
@@ -478,6 +495,10 @@ impl ProcessRuntime for PALContext  {
             0x4FFFFFEF => { return self.pal_svsm_mpk_exit_domain(); }    // 接口4: 退出安全域
             0x4FFFFFEE => { return self.pal_svsm_mpk_free_pkey(); }      // 接口6: 释放 pkey
             0x4FFFFFED => { return self.pal_svsm_mpk_query_pkru(); }     // 辅助: 查询 PKRU
+            // [THREAD] Thread management
+            0x4FFFFFEC => { return self.pal_svsm_thread_create(); }
+            0x4FFFFFEB => { return self.pal_svsm_thread_join(); }
+            0x4FFFFFEA => { return self.pal_svsm_thread_exit(); }
             // monitor calls (other)
             0x4EFFFFFF => {
                 return self.handle_exception();
@@ -754,6 +775,151 @@ impl ProcessRuntime for PALContext  {
     }
 
     /* ========== [MPK-DEV] MPK 六接口处理函数 - 结束 ========== */
+
+    /* ========== [THREAD] Thread management - 开始 ========== */
+
+    /// Create a new thread (allocate VMSA, defer execution to join)
+    ///
+    /// Registers: rax=0x4FFFFFEC, rbx=entry_rip, rcx=stack_top, rdx=gs_base, r8=arg
+    /// Returns:   rax=thread_id (0..7), rcx=0 on success; rcx!=0 on error
+    fn pal_svsm_thread_create(&mut self) -> bool {
+        let entry_rip = self.vmsa.rbx;
+        let stack_top = self.vmsa.rcx;
+        let gs_base   = self.vmsa.rdx;
+        let arg       = self.vmsa.r8;
+
+        let slot_id = self.threads.iter().position(|s| matches!(s, ThreadSlot::Free));
+        let slot_id = match slot_id {
+            Some(id) => id,
+            None => {
+                self.vmsa.rax = u64::MAX;
+                self.vmsa.rcx = 1;
+                log::error!("[Thread] create: no free slots");
+                return true;
+            }
+        };
+
+        let vmsa_paddr = allocate_page();
+        let mapping = PerCPUPageMappingGuard::create_4k(vmsa_paddr).unwrap();
+        let new_vmsa: &mut VMSA = unsafe {
+            mapping.virt_addr().as_mut_ptr::<VMSA>().as_mut().unwrap()
+        };
+
+        *new_vmsa = *self.vmsa;
+        new_vmsa.rip    = entry_rip;
+        new_vmsa.rsp    = stack_top;
+        new_vmsa.rbp    = stack_top;
+        new_vmsa.gs.base = gs_base;
+        new_vmsa.rdi    = arg;
+
+        // Step 1: Mark page as VMPL1 RWX (regular data page, so we can write VMSA content)
+        rmp_adjust(
+            mapping.virt_addr(),
+            RMPFlags::VMPL1 | RMPFlags::RWX,
+            PageSize::Regular,
+        ).unwrap();
+        // Step 2: Set guest VMSA flag
+        rmp_set_guest_vmsa(mapping.virt_addr()).unwrap();
+        // Step 3: Mark page as VMSA type for VMPL1
+        rmp_adjust(
+            mapping.virt_addr(),
+            RMPFlags::VMPL1 | RMPFlags::VMSA,
+            PageSize::Regular,
+        ).unwrap();
+
+        self.threads[slot_id] = ThreadSlot::Created(vmsa_paddr);
+
+        self.vmsa.rax = slot_id as u64;
+        self.vmsa.rcx = 0;
+        log::info!(
+            "[Thread] created id={}: rip={:#x} rsp={:#x} gs={:#x} arg={:#x}",
+            slot_id, entry_rip, stack_top, gs_base, arg
+        );
+        true
+    }
+
+    /// Join a thread (run it on the current CPU until it calls THREAD_EXIT)
+    ///
+    /// Registers: rax=0x4FFFFFEB, rbx=thread_id
+    /// Returns:   rax=exit_code, rcx=0 on success
+    fn pal_svsm_thread_join(&mut self) -> bool {
+        let tid = self.vmsa.rbx as usize;
+
+        if tid >= MAX_THREADS_PER_PROCESS {
+            self.vmsa.rcx = 1;
+            return true;
+        }
+
+        let thread_paddr = match self.threads[tid] {
+            ThreadSlot::Created(pa) => pa,
+            ThreadSlot::Done(code) => {
+                self.vmsa.rax = code;
+                self.vmsa.rcx = 0;
+                return true;
+            }
+            _ => {
+                self.vmsa.rcx = 2;
+                return true;
+            }
+        };
+
+        let main_vmsa_ptr: *mut VMSA = self.vmsa;
+
+        let mapping = PerCPUPageMappingGuard::create_4k(thread_paddr).unwrap();
+        let thread_vmsa: &'static mut VMSA = unsafe {
+            mapping.virt_addr().as_mut_ptr::<VMSA>().as_mut().unwrap()
+        };
+
+        let apic_id      = this_cpu().get_apic_id();
+        let sev_features = thread_vmsa.sev_features;
+
+        log::info!("[Thread] joining id={}", tid);
+
+        self.vmsa = thread_vmsa;
+
+        loop {
+            unsafe {
+                (*(*this_cpu_unsafe()).ghcb).ap_create(
+                    thread_paddr,
+                    u64::from(apic_id),
+                    TRUSTLET_VMPL,
+                    sev_features,
+                ).unwrap()
+            }
+
+            if self.vmsa.rax == 0x4FFFFFEA {
+                let exit_code = self.vmsa.rbx;
+                self.vmsa.rip += 2;
+                log::info!("[Thread] id={} exited code={}", tid, exit_code);
+
+                self.vmsa = unsafe { &mut *main_vmsa_ptr };
+                self.vmsa.rax = exit_code;
+                self.vmsa.rcx = 0;
+                self.threads[tid] = ThreadSlot::Done(exit_code);
+                return true;
+            }
+
+            if !self.handle_process_request() {
+                log::warn!("[Thread] id={} terminated unexpectedly", tid);
+                self.vmsa = unsafe { &mut *main_vmsa_ptr };
+                self.vmsa.rcx = 3;
+                self.threads[tid] = ThreadSlot::Done(u64::MAX);
+                return true;
+            }
+        }
+    }
+
+    /// Thread exit (called by the thread itself)
+    ///
+    /// Registers: rax=0x4FFFFFEA, rbx=exit_code
+    /// Should never be reached via handle_process_request dispatch because
+    /// pal_svsm_thread_join intercepts it before dispatch.
+    fn pal_svsm_thread_exit(&mut self) -> bool {
+        log::warn!("[Thread] thread_exit called outside join context");
+        false
+    }
+
+    /* ========== [THREAD] Thread management - 结束 ========== */
 
     /// Handle CPUID instruction from the trustlet
     /// 
