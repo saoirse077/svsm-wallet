@@ -15,6 +15,10 @@ use crate::process_manager::monitor_init;
 use crate::requests::{request_loop, request_processing_main};
 use crate::task::{create_kernel_task, schedule_init};
 use crate::utils::immut_after_init::immut_after_init_set_multithreaded;
+use crate::process_runtime::runtime::{thread_runner_idle, NUM_ACTIVE_RUNNERS};
+use core::sync::atomic::Ordering;
+
+const THREAD_RUNNER_BASE_APIC: u32 = 1;
 
 fn start_cpu(platform: &dyn SvsmPlatform, apic_id: u32, vtom: u64) {
     let start_rip: u64 = (start_ap as *const u8) as u64;
@@ -59,7 +63,9 @@ pub fn start_secondary_cpus(platform: &dyn SvsmPlatform, cpus: &[ACPICPUInfo], v
         start_cpu(platform, c.apic_id, vtom);
         count += 1;
     }
-    log::info!("Brought {} AP(s) online", count);
+    let runners = count.min(crate::process_runtime::runtime::MAX_THREAD_RUNNERS);
+    NUM_ACTIVE_RUNNERS.store(runners as u64, Ordering::Release);
+    log::info!("Brought {} AP(s) online, {} thread runner(s)", count, runners);
 }
 
 #[no_mangle]
@@ -68,17 +74,21 @@ fn start_ap() {
         .setup_on_cpu(SVSM_PLATFORM.as_dyn_ref())
         .expect("setup_on_cpu() failed");
 
-    this_cpu_mut()
-        .setup_idle_task(ap_request_loop)
-        .expect("Failed to allocated idle task for AP");
+    let apic_id = this_cpu_mut().get_apic_id();
 
-    // Send a life-sign
-    log::info!("AP with APIC-ID {} is online", this_cpu_mut().get_apic_id());
+    if apic_id >= THREAD_RUNNER_BASE_APIC {
+        this_cpu_mut()
+            .setup_idle_task(thread_runner_idle)
+            .expect("Failed to setup thread runner idle task");
+        log::info!("AP with APIC-ID {} is online (thread runner)", apic_id);
+    } else {
+        this_cpu_mut()
+            .setup_idle_task(ap_request_loop)
+            .expect("Failed to allocated idle task for AP");
+        log::info!("AP with APIC-ID {} is online (request handler)", apic_id);
+    }
 
-    // Init Monitor Memory for current core
     monitor_init();
-
-    // Set CPU online so that BSP can proceed
     this_cpu_shared().set_online();
 
     sse_init();

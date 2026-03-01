@@ -8,7 +8,7 @@ use core::cmp::Ordering;
 extern crate alloc;
 use alloc::collections::BTreeMap;
 use num_enum::TryFromPrimitive;
-use crate::address::PhysAddr;
+use crate::address::{Address, PhysAddr};
 use crate::process_manager::process_paging::TP_LIBOS_START_VADDR;
 use crate::{address::VirtAddr, cpu::{cpuid::{cpuid_table_raw, CpuidResult}, percpu::{this_cpu, this_cpu_unsafe}}, map_paddr, mm::PerCPUPageMappingGuard, paddr_as_slice, process_manager::{process::{ProcessID, TrustedProcess, PROCESS_STORE}, process_memory::allocate_page, process_paging::{GraminePalProtFlags, ProcessPageFlags, ProcessPageTableRef}}, protocols::{errors::SvsmReqError, RequestParams}, vaddr_as_u64_slice};
 use crate::process_manager::outb::{breakdown_outb, outb};
@@ -18,7 +18,13 @@ use crate::types::PageSize;
 use crate::sev::RMPFlags;
 use crate::sev::rmp_adjust;
 use crate::sev::utils::rmp_set_guest_vmsa;
-use crate::process_manager::process_memory::{PGD, addr_to_idx};
+use crate::process_manager::process_memory::{PGD, addr_to_idx, free_page};
+use crate::locking::SpinLock;
+
+/// Global lock protecting page table modifications to prevent
+/// concurrent corruption when BSP and AP thread runners modify
+/// the same page table (shared CR3).
+static PAGE_TABLE_LOCK: SpinLock<()> = SpinLock::new(());
 use crate::process_manager::memory_channels::{INPUT_VADDR, OUTPUT_VADDR};
 
 // [MPK-DEV] MPK 六接口内存管理模块导入
@@ -29,8 +35,10 @@ use crate::process_manager::mpk_memory::{
     mpk_free_pkey,          // 接口6: 释放 pkey（可选同时释放内存）
 };
 
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering as AtomicOrdering};
+
 #[cfg(feature = "stat")]
-use core::sync::atomic;
+use core::sync::atomic as stat_atomic;
 
 const TRUSTLET_VMPL: u64 = 1;
 
@@ -66,10 +74,11 @@ pub trait ProcessRuntime {
     fn pal_svsm_mpk_free_pkey(&mut self) -> bool;      // 接口6: 释放 pkey (0x4FFFFFEE)
     fn pal_svsm_mpk_query_pkru(&mut self) -> bool;     // 辅助: 查询 PKRU (0x4FFFFFED)
 
-    // [THREAD] Thread management (same-CPU sequential execution)
+    // [THREAD] Thread management (multi-vCPU)
     fn pal_svsm_thread_create(&mut self) -> bool;    // 0x4FFFFFEC
     fn pal_svsm_thread_join(&mut self) -> bool;      // 0x4FFFFFEB
     fn pal_svsm_thread_exit(&mut self) -> bool;      // 0x4FFFFFEA
+    fn pal_svsm_query_thread_capacity(&mut self) -> bool; // 0x4FFFFFE9
 }
 
 /// Invocation type of invokeTrustlet
@@ -159,13 +168,64 @@ impl MmapManager {
     }
 }
 
-const MAX_THREADS_PER_PROCESS: usize = 8;
+/// Global shared thread slots for multi-vCPU thread execution.
+/// AP with APIC ID `n` monitors slot `n-1` (APIC 0 is BSP).
+pub const MAX_THREAD_RUNNERS: usize = 7;
 
-#[derive(Debug, Clone, Copy)]
-enum ThreadSlot {
-    Free,
-    Created(PhysAddr),
-    Done(u64),
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadSlotState {
+    Free = 0,
+    Pending = 1,
+    Running = 2,
+    Done = 3,
+}
+
+pub struct ThreadSlotShared {
+    pub state: AtomicU8,
+    pub vmsa_paddr: AtomicU64,
+    pub exit_code: AtomicU64,
+    pub process_id: AtomicU64,
+}
+
+impl core::fmt::Debug for ThreadSlotShared {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ThreadSlotShared")
+            .field("state", &self.state.load(AtomicOrdering::Relaxed))
+            .field("vmsa_paddr", &self.vmsa_paddr.load(AtomicOrdering::Relaxed))
+            .finish()
+    }
+}
+
+impl ThreadSlotShared {
+    const fn new() -> Self {
+        ThreadSlotShared {
+            state: AtomicU8::new(ThreadSlotState::Free as u8),
+            vmsa_paddr: AtomicU64::new(0),
+            exit_code: AtomicU64::new(0),
+            process_id: AtomicU64::new(0),
+        }
+    }
+}
+
+unsafe impl Sync for ThreadSlotShared {}
+
+pub static THREAD_SLOTS: [ThreadSlotShared; MAX_THREAD_RUNNERS] = [
+    ThreadSlotShared::new(), ThreadSlotShared::new(), ThreadSlotShared::new(),
+    ThreadSlotShared::new(), ThreadSlotShared::new(), ThreadSlotShared::new(),
+    ThreadSlotShared::new(),
+];
+
+pub static NUM_ACTIVE_RUNNERS: AtomicU64 = AtomicU64::new(0);
+
+fn find_free_thread_slot() -> Option<usize> {
+    let num = NUM_ACTIVE_RUNNERS.load(AtomicOrdering::Acquire) as usize;
+    for i in 0..num {
+        if THREAD_SLOTS[i].state.load(AtomicOrdering::Acquire) == ThreadSlotState::Free as u8 {
+            return Some(i);
+        }
+    }
+    None
 }
 
 #[derive(Debug)]
@@ -180,7 +240,6 @@ pub struct PALContext {
     invocation_arg_guest_vaddr: u64,
     invocation_arg_size: usize,
     return_value: u64,
-    threads: [ThreadSlot; MAX_THREADS_PER_PROCESS],
 }
 
 pub fn early_invoke(zygote: &'static mut TrustedProcess) {
@@ -206,7 +265,6 @@ pub fn early_invoke(zygote: &'static mut TrustedProcess) {
         invocation_arg_guest_vaddr: 0,
         invocation_arg_size: 0,
         return_value: 0,
-        threads: [ThreadSlot::Free; MAX_THREADS_PER_PROCESS],
     };
 
     loop {
@@ -361,7 +419,6 @@ pub fn invoke_trustlet(params: &mut RequestParams) -> Result<(), SvsmReqError> {
             invocation_arg_guest_vaddr,
             invocation_arg_size,
             return_value: TrustletReturnType::ERROR as u64,
-            threads: [ThreadSlot::Free; MAX_THREADS_PER_PROCESS],
         };
 
     // Execution loop of the trustlet
@@ -499,6 +556,7 @@ impl ProcessRuntime for PALContext  {
             0x4FFFFFEC => { return self.pal_svsm_thread_create(); }
             0x4FFFFFEB => { return self.pal_svsm_thread_join(); }
             0x4FFFFFEA => { return self.pal_svsm_thread_exit(); }
+            0x4FFFFFE9 => { return self.pal_svsm_query_thread_capacity(); }
             // monitor calls (other)
             0x4EFFFFFF => {
                 return self.handle_exception();
@@ -778,18 +836,17 @@ impl ProcessRuntime for PALContext  {
 
     /* ========== [THREAD] Thread management - 开始 ========== */
 
-    /// Create a new thread (allocate VMSA, defer execution to join)
+    /// Create a thread: allocate VMSA, post to global THREAD_SLOTS for AP pickup.
     ///
     /// Registers: rax=0x4FFFFFEC, rbx=entry_rip, rcx=stack_top, rdx=gs_base, r8=arg
-    /// Returns:   rax=thread_id (0..7), rcx=0 on success; rcx!=0 on error
+    /// Returns:   rax=slot_id, rcx=0 on success; rax=MAX, rcx!=0 on error
     fn pal_svsm_thread_create(&mut self) -> bool {
         let entry_rip = self.vmsa.rbx;
         let stack_top = self.vmsa.rcx;
         let gs_base   = self.vmsa.rdx;
         let arg       = self.vmsa.r8;
 
-        let slot_id = self.threads.iter().position(|s| matches!(s, ThreadSlot::Free));
-        let slot_id = match slot_id {
+        let slot_id = match find_free_thread_slot() {
             Some(id) => id,
             None => {
                 self.vmsa.rax = u64::MAX;
@@ -812,111 +869,72 @@ impl ProcessRuntime for PALContext  {
         new_vmsa.gs.base = gs_base;
         new_vmsa.rdi    = arg;
 
-        // Step 1: Mark page as VMPL1 RWX (regular data page, so we can write VMSA content)
         rmp_adjust(
             mapping.virt_addr(),
             RMPFlags::VMPL1 | RMPFlags::RWX,
             PageSize::Regular,
         ).unwrap();
-        // Step 2: Set guest VMSA flag
         rmp_set_guest_vmsa(mapping.virt_addr()).unwrap();
-        // Step 3: Mark page as VMSA type for VMPL1
         rmp_adjust(
             mapping.virt_addr(),
             RMPFlags::VMPL1 | RMPFlags::VMSA,
             PageSize::Regular,
         ).unwrap();
 
-        self.threads[slot_id] = ThreadSlot::Created(vmsa_paddr);
+        THREAD_SLOTS[slot_id].vmsa_paddr.store(vmsa_paddr.bits() as u64, AtomicOrdering::Release);
+        THREAD_SLOTS[slot_id].exit_code.store(0, AtomicOrdering::Release);
+        THREAD_SLOTS[slot_id].process_id.store(self.process.id, AtomicOrdering::Release);
+        THREAD_SLOTS[slot_id].state.store(ThreadSlotState::Pending as u8, AtomicOrdering::Release);
 
         self.vmsa.rax = slot_id as u64;
         self.vmsa.rcx = 0;
         log::info!(
-            "[Thread] created id={}: rip={:#x} rsp={:#x} gs={:#x} arg={:#x}",
-            slot_id, entry_rip, stack_top, gs_base, arg
+            "[Thread] created slot={}: rip={:#x} rsp={:#x} gs={:#x} arg={:#x} vmsa={:#x}",
+            slot_id, entry_rip, stack_top, gs_base, arg, vmsa_paddr
         );
         true
     }
 
-    /// Join a thread (run it on the current CPU until it calls THREAD_EXIT)
+    /// Join a thread: spin-wait on THREAD_SLOTS until AP sets Done.
     ///
-    /// Registers: rax=0x4FFFFFEB, rbx=thread_id
+    /// Registers: rax=0x4FFFFFEB, rbx=slot_id
     /// Returns:   rax=exit_code, rcx=0 on success
     fn pal_svsm_thread_join(&mut self) -> bool {
         let tid = self.vmsa.rbx as usize;
+        let num = NUM_ACTIVE_RUNNERS.load(AtomicOrdering::Acquire) as usize;
 
-        if tid >= MAX_THREADS_PER_PROCESS {
+        if tid >= num {
             self.vmsa.rcx = 1;
             return true;
         }
 
-        let thread_paddr = match self.threads[tid] {
-            ThreadSlot::Created(pa) => pa,
-            ThreadSlot::Done(code) => {
-                self.vmsa.rax = code;
-                self.vmsa.rcx = 0;
-                return true;
-            }
-            _ => {
-                self.vmsa.rcx = 2;
-                return true;
-            }
-        };
+        log::info!("[Thread] joining slot={}", tid);
 
-        let main_vmsa_ptr: *mut VMSA = self.vmsa;
-
-        let mapping = PerCPUPageMappingGuard::create_4k(thread_paddr).unwrap();
-        let thread_vmsa: &'static mut VMSA = unsafe {
-            mapping.virt_addr().as_mut_ptr::<VMSA>().as_mut().unwrap()
-        };
-
-        let apic_id      = this_cpu().get_apic_id();
-        let sev_features = thread_vmsa.sev_features;
-
-        log::info!("[Thread] joining id={}", tid);
-
-        self.vmsa = thread_vmsa;
-
-        loop {
-            unsafe {
-                (*(*this_cpu_unsafe()).ghcb).ap_create(
-                    thread_paddr,
-                    u64::from(apic_id),
-                    TRUSTLET_VMPL,
-                    sev_features,
-                ).unwrap()
-            }
-
-            if self.vmsa.rax == 0x4FFFFFEA {
-                let exit_code = self.vmsa.rbx;
-                self.vmsa.rip += 2;
-                log::info!("[Thread] id={} exited code={}", tid, exit_code);
-
-                self.vmsa = unsafe { &mut *main_vmsa_ptr };
-                self.vmsa.rax = exit_code;
-                self.vmsa.rcx = 0;
-                self.threads[tid] = ThreadSlot::Done(exit_code);
-                return true;
-            }
-
-            if !self.handle_process_request() {
-                log::warn!("[Thread] id={} terminated unexpectedly", tid);
-                self.vmsa = unsafe { &mut *main_vmsa_ptr };
-                self.vmsa.rcx = 3;
-                self.threads[tid] = ThreadSlot::Done(u64::MAX);
-                return true;
-            }
+        while THREAD_SLOTS[tid].state.load(AtomicOrdering::Acquire) != ThreadSlotState::Done as u8 {
+            core::hint::spin_loop();
         }
+
+        let exit_code = THREAD_SLOTS[tid].exit_code.load(AtomicOrdering::Acquire);
+        THREAD_SLOTS[tid].state.store(ThreadSlotState::Free as u8, AtomicOrdering::Release);
+
+        self.vmsa.rax = exit_code;
+        self.vmsa.rcx = 0;
+        log::info!("[Thread] join slot={} done, exit_code={}", tid, exit_code);
+        true
     }
 
-    /// Thread exit (called by the thread itself)
-    ///
-    /// Registers: rax=0x4FFFFFEA, rbx=exit_code
-    /// Should never be reached via handle_process_request dispatch because
-    /// pal_svsm_thread_join intercepts it before dispatch.
+    /// Thread exit: intercepted in thread_runner_idle before reaching dispatch.
     fn pal_svsm_thread_exit(&mut self) -> bool {
-        log::warn!("[Thread] thread_exit called outside join context");
+        log::warn!("[Thread] thread_exit called outside thread runner context");
         false
+    }
+
+    /// Query the number of available thread runners (AP count).
+    fn pal_svsm_query_thread_capacity(&mut self) -> bool {
+        let cap = NUM_ACTIVE_RUNNERS.load(AtomicOrdering::Acquire);
+        self.vmsa.rax = cap;
+        log::info!("[Thread] query_capacity: {}", cap);
+        true
     }
 
     /* ========== [THREAD] Thread management - 结束 ========== */
@@ -1003,15 +1021,9 @@ impl ProcessRuntime for PALContext  {
     /// * rbx: trustlet's virtual address to free
     /// *
     fn pal_svsm_virt_free(&mut self) -> bool {
-        //log::info!("FREE");
         let page_table = self.vmsa.cr3;
-        let mut page_table_ref = ProcessPageTableRef::default();
-        page_table_ref.set_external_table(page_table);
-
         let addr = self.vmsa.rbx;
         let size = self.vmsa.rcx;
-
-        //TODO: Check if Address can used
 
         if size % 4096 != 0 {
             self.vmsa.rcx = u64::from_ne_bytes((-1i64).to_ne_bytes());
@@ -1022,6 +1034,10 @@ impl ProcessRuntime for PALContext  {
             self.vmsa.rcx = u64::from_ne_bytes((-1i64).to_ne_bytes());
             return true;
         }
+
+        let _pt_guard = PAGE_TABLE_LOCK.lock();
+        let mut page_table_ref = ProcessPageTableRef::default();
+        page_table_ref.set_external_table(page_table);
         page_table_ref.remove_pages(VirtAddr::from(addr), size / 4096);
 
         return true;
@@ -1038,22 +1054,16 @@ impl ProcessRuntime for PALContext  {
     /// Retrun:
     /// * rcx: 0 on success, -1 on failure
     fn pal_svsm_virt_alloc(&mut self) -> bool {
-        // Getting the Page Table of the current Trustlet being executed
         let page_table = self.vmsa.cr3;
-        let mut page_table_ref = ProcessPageTableRef::default();
-        page_table_ref.set_external_table(page_table);
-
         let addr = self.vmsa.rbx;
         let size = self.vmsa.rcx;
         let flags = self.vmsa.rdx;
 
-        // Check if size is a multiple of pages
         if size % 4096 != 0 {
             self.vmsa.rcx = u64::from_ne_bytes((-1i64).to_ne_bytes());
             return true;
         }
 
-        // Check if address starts at page boundary
         if addr % 4096 != 0 {
             self.vmsa.rcx = u64::from_ne_bytes((-1i64).to_ne_bytes());
             return true;
@@ -1062,17 +1072,13 @@ impl ProcessRuntime for PALContext  {
         if flags & GraminePalProtFlags::WRITE.bits() != 0 {
             page_flags = page_flags | ProcessPageFlags::WRITABLE;
         }
-        /*
-        // XXX: we can omit this for now as currently we support only one thread
-        if flags & GraminePalProtFlags::WRITECOPY.bits() != 0 {
-            page_flags = page_flags | ProcessPageFlags::COPY_ON_WRITE;
-            page_flags = page_flags & !ProcessPageFlags::WRITABLE;
-        }
-        */
         if flags & GraminePalProtFlags::EXEC.bits() != 0 {
             page_flags = page_flags & !ProcessPageFlags::NO_EXECUTE;
         }
 
+        let _pt_guard = PAGE_TABLE_LOCK.lock();
+        let mut page_table_ref = ProcessPageTableRef::default();
+        page_table_ref.set_external_table(page_table);
         page_table_ref.add_pages(VirtAddr::from(addr), size / 4096, page_flags);
 
         self.vmsa.rcx = u64::from_ne_bytes((0i64).to_ne_bytes());
@@ -1484,7 +1490,7 @@ impl ProcessRuntime for PALContext  {
             }
             14 => {
                 #[cfg(feature = "stat")]
-                crate::sev::utils::stat::PF_COUNT.fetch_add(1, atomic::Ordering::Relaxed);
+                crate::sev::utils::stat::PF_COUNT.fetch_add(1, stat_atomic::Ordering::Relaxed);
 
                 let rip= self.vmsa.rip;
                 let cr2 = self.vmsa.cr2;
@@ -1565,7 +1571,7 @@ impl ProcessRuntime for PALContext  {
                 if error_code & PF_PRESENT != 0 && error_code & PF_WRITE != 0 {
                     // CoW
                     #[cfg(feature = "stat")]
-                    crate::sev::utils::stat::COW_COUNT.fetch_add(1, atomic::Ordering::Relaxed);
+                    crate::sev::utils::stat::COW_COUNT.fetch_add(1, stat_atomic::Ordering::Relaxed);
 
                     let mut page_table_ref = ProcessPageTableRef::default();
                     page_table_ref.set_external_table(self.vmsa.cr3);
@@ -1747,5 +1753,87 @@ impl ProcessRuntime for PALContext  {
 
         log::info!(" [Trustlet] ---------------------------------");
         false
+    }
+}
+
+/* ========== Multi-vCPU Thread Runner ========== */
+
+fn apic_id_to_slot(apic_id: u32) -> usize {
+    (apic_id as usize) - 1
+}
+
+/// AP idle loop: each AP monitors its dedicated THREAD_SLOT.
+/// When a slot transitions to Pending, the AP runs the thread VMSA on this CPU.
+#[no_mangle]
+pub extern "C" fn thread_runner_idle() {
+    let apic_id = this_cpu().get_apic_id();
+    let slot_idx = apic_id_to_slot(apic_id);
+    log::info!("[ThreadRunner] AP {} ready, monitoring slot {}", apic_id, slot_idx);
+
+    loop {
+        let state = THREAD_SLOTS[slot_idx].state.load(AtomicOrdering::Acquire);
+        if state == ThreadSlotState::Pending as u8 {
+            THREAD_SLOTS[slot_idx].state.store(ThreadSlotState::Running as u8, AtomicOrdering::Release);
+            log::info!("[ThreadRunner] AP {} picked up slot {}", apic_id, slot_idx);
+
+            run_thread_on_this_cpu(slot_idx);
+
+            let vmsa_paddr = PhysAddr::from(THREAD_SLOTS[slot_idx].vmsa_paddr.load(AtomicOrdering::Acquire));
+            free_page(vmsa_paddr);
+            THREAD_SLOTS[slot_idx].vmsa_paddr.store(0, AtomicOrdering::Release);
+            THREAD_SLOTS[slot_idx].state.store(ThreadSlotState::Done as u8, AtomicOrdering::Release);
+
+            log::info!("[ThreadRunner] AP {} slot {} done", apic_id, slot_idx);
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Execute a thread VMSA on the current AP. Loops ap_create until THREAD_EXIT.
+fn run_thread_on_this_cpu(slot_idx: usize) {
+    let vmsa_paddr = PhysAddr::from(THREAD_SLOTS[slot_idx].vmsa_paddr.load(AtomicOrdering::Acquire));
+    let mapping = PerCPUPageMappingGuard::create_4k(vmsa_paddr).unwrap();
+    let vmsa: &'static mut VMSA = unsafe {
+        mapping.virt_addr().as_mut_ptr::<VMSA>().as_mut().unwrap()
+    };
+    let sev_features = vmsa.sev_features;
+    let apic_id = this_cpu().get_apic_id();
+
+    let process_id = THREAD_SLOTS[slot_idx].process_id.load(AtomicOrdering::Acquire);
+    let process = PROCESS_STORE.get(ProcessID(process_id as usize));
+
+    let mut rc = PALContext {
+        process,
+        vmsa,
+        string_buf: [0u8; 256],
+        string_pos: 0,
+        result_addr: 0,
+        result_size: 0,
+        guest_page_table: 0,
+        invocation_arg_guest_vaddr: 0,
+        invocation_arg_size: 0,
+        return_value: 0,
+    };
+
+    loop {
+        unsafe {
+            (*(*this_cpu_unsafe()).ghcb).ap_create(
+                vmsa_paddr, u64::from(apic_id), TRUSTLET_VMPL, sev_features,
+            ).unwrap();
+        }
+
+        if rc.vmsa.rax == 0x4FFFFFEA {
+            rc.vmsa.rip += 2;
+            let exit_code = rc.vmsa.rbx;
+            log::info!("[ThreadRunner] slot {} thread exit, code={}", slot_idx, exit_code);
+            THREAD_SLOTS[slot_idx].exit_code.store(exit_code, AtomicOrdering::Release);
+            return;
+        }
+
+        if !rc.handle_process_request() {
+            log::warn!("[ThreadRunner] slot {} terminated unexpectedly", slot_idx);
+            THREAD_SLOTS[slot_idx].exit_code.store(u64::MAX, AtomicOrdering::Release);
+            return;
+        }
     }
 }
