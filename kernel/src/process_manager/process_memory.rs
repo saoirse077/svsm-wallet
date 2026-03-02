@@ -395,7 +395,10 @@ pub fn preallocate_memory() {
 }
 
 pub fn allocate_page() -> PhysAddr {
-    PROCESS_MEM_CONFIG.lock().get_free_page()
+    let mut guard = PROCESS_MEM_CONFIG.lock();
+    let page = guard.get_free_page();
+    drop(guard);
+    page
 }
 
 //pub fn free_page(paddr: u64) {

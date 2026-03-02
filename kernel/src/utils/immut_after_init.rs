@@ -18,14 +18,10 @@ pub type ImmutAfterInitResult<T> = Result<T, core::convert::Infallible>;
 pub type ImmutAfterInitResult<T> = Result<T, ImmutAfterInitError>;
 
 #[cfg(debug_assertions)]
-static MULTI_THREADED: AtomicBool = AtomicBool::new(false);
-
-#[cfg(debug_assertions)]
 #[derive(Clone, Copy, Debug)]
 pub enum ImmutAfterInitError {
     AlreadyInit,
     Uninitialized,
-    NotSingleThreaded,
 }
 
 /// A memory location which is effectively immutable after initalization code
@@ -111,14 +107,6 @@ impl<T: Copy> ImmutAfterInitCell<T> {
         Ok(())
     }
 
-    fn check_single_threaded(&self) -> ImmutAfterInitResult<()> {
-        #[cfg(debug_assertions)]
-        if MULTI_THREADED.load(Ordering::Relaxed) {
-            return Err(ImmutAfterInitError::NotSingleThreaded);
-        }
-        Ok(())
-    }
-
     // The caller must check the initialization status to avoid double init bugs
     unsafe fn set_inner(&self, v: &T) {
         self.set_init();
@@ -144,7 +132,6 @@ impl<T: Copy> ImmutAfterInitCell<T> {
     /// * `v` - Initialization value.
     pub fn init(&self, v: &T) -> ImmutAfterInitResult<()> {
         self.check_uninit()?;
-        self.check_single_threaded()?;
         unsafe { self.set_inner(v) };
         Ok(())
     }
@@ -156,7 +143,6 @@ impl<T: Copy> ImmutAfterInitCell<T> {
     ///
     /// * `v` - Initialization value.
     pub fn reinit(&self, v: &T) -> ImmutAfterInitResult<()> {
-        self.check_single_threaded()?;
         unsafe { self.set_inner(v) }
         Ok(())
     }
@@ -323,7 +309,3 @@ impl<T: Copy> Deref for ImmutAfterInitRef<'_, T> {
 unsafe impl<T: Copy + Send> Send for ImmutAfterInitRef<'_, T> {}
 unsafe impl<T: Copy + Send + Sync> Sync for ImmutAfterInitRef<'_, T> {}
 
-pub fn immut_after_init_set_multithreaded() {
-    #[cfg(debug_assertions)]
-    MULTI_THREADED.store(true, Ordering::Relaxed);
-}

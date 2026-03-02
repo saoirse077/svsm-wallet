@@ -85,6 +85,14 @@ fn core_create_vcpu(params: &RequestParams) -> Result<(), SvsmReqError> {
     let pcaa = PhysAddr::from(params.rdx);
     let apic_id: u32 = (params.r8 & 0xffff_ffff) as u32;
 
+    if apic_id >= crate::cpu::smp::THREAD_RUNNER_BASE_APIC {
+        log::info!(
+            "[Core] Rejecting CREATE_VCPU for SVSM-reserved APIC {}",
+            apic_id
+        );
+        return Err(SvsmReqError::invalid_parameter());
+    }
+
     // Check VMSA address
     if !valid_phys_address(paddr) || !paddr.is_page_aligned() {
         return Err(SvsmReqError::invalid_address());

@@ -1,4 +1,4 @@
-use cpuarch::vmsa::VMSA;
+use cpuarch::vmsa::{VMSA, GuestVMExit};
 use igvm_defs::PAGE_SIZE_4K;
 use core::ffi::CStr;
 use core::convert::TryInto;
@@ -869,6 +869,16 @@ impl ProcessRuntime for PALContext  {
         new_vmsa.gs.base = gs_base;
         new_vmsa.rdi    = arg;
 
+        // Clear residual exit state inherited from the parent VMSA.
+        // The parent was in the middle of a CPUID trap when copied;
+        // leaving these fields dirty may confuse the hardware/hypervisor
+        // when ap_create tries to start the new vCPU.
+        new_vmsa.guest_exit_code = GuestVMExit::INVALID;
+        new_vmsa.guest_exitinfo1 = 0;
+        new_vmsa.guest_exitinfo2 = 0;
+        new_vmsa.guest_nrip = 0;
+        new_vmsa.guest_exitintinfo = 0;
+
         rmp_adjust(
             mapping.virt_addr(),
             RMPFlags::VMPL1 | RMPFlags::RWX,
@@ -881,16 +891,18 @@ impl ProcessRuntime for PALContext  {
             PageSize::Regular,
         ).unwrap();
 
+        let slot_ptr = &THREAD_SLOTS[slot_id] as *const ThreadSlotShared;
         THREAD_SLOTS[slot_id].vmsa_paddr.store(vmsa_paddr.bits() as u64, AtomicOrdering::Release);
         THREAD_SLOTS[slot_id].exit_code.store(0, AtomicOrdering::Release);
         THREAD_SLOTS[slot_id].process_id.store(self.process.id, AtomicOrdering::Release);
         THREAD_SLOTS[slot_id].state.store(ThreadSlotState::Pending as u8, AtomicOrdering::Release);
 
+        let verify_state = THREAD_SLOTS[slot_id].state.load(AtomicOrdering::Acquire);
         self.vmsa.rax = slot_id as u64;
         self.vmsa.rcx = 0;
         log::info!(
-            "[Thread] created slot={}: rip={:#x} rsp={:#x} gs={:#x} arg={:#x} vmsa={:#x}",
-            slot_id, entry_rip, stack_top, gs_base, arg, vmsa_paddr
+            "[Thread] created slot={} @ {:p}: rip={:#x} rsp={:#x} gs={:#x} arg={:#x} vmsa={:#x} state_verify={}",
+            slot_id, slot_ptr, entry_rip, stack_top, gs_base, arg, vmsa_paddr, verify_state
         );
         true
     }
@@ -1759,19 +1771,28 @@ impl ProcessRuntime for PALContext  {
 /* ========== Multi-vCPU Thread Runner ========== */
 
 fn apic_id_to_slot(apic_id: u32) -> usize {
-    (apic_id as usize) - 1
+    (apic_id as usize) - (crate::cpu::smp::THREAD_RUNNER_BASE_APIC as usize)
 }
 
 /// AP idle loop: each AP monitors its dedicated THREAD_SLOT.
 /// When a slot transitions to Pending, the AP runs the thread VMSA on this CPU.
+///
+/// ThreadRunner APs are invisible to the Guest OS. The Guest's AP CREATE
+/// requests for these APIC IDs are rejected by `core_create_vcpu`, so no
+/// Guest VMPL2 scheduling is needed here.
 #[no_mangle]
 pub extern "C" fn thread_runner_idle() {
+    // Ensure free page list (PGD[1]) is mapped in the post-schedule_init page table.
+    // monitor_init() in start_ap() writes PGD[1] to the pre-schedule page table,
+    // but schedule_init() switches to a new CR3, so we must re-apply here.
+    crate::process_manager::monitor_init();
     let apic_id = this_cpu().get_apic_id();
     let slot_idx = apic_id_to_slot(apic_id);
-    log::info!("[ThreadRunner] AP {} ready, monitoring slot {}", apic_id, slot_idx);
+    log::info!("[ThreadRunner] AP {} ready, slot {}", apic_id, slot_idx);
 
     loop {
         let state = THREAD_SLOTS[slot_idx].state.load(AtomicOrdering::Acquire);
+
         if state == ThreadSlotState::Pending as u8 {
             THREAD_SLOTS[slot_idx].state.store(ThreadSlotState::Running as u8, AtomicOrdering::Release);
             log::info!("[ThreadRunner] AP {} picked up slot {}", apic_id, slot_idx);
@@ -1785,6 +1806,7 @@ pub extern "C" fn thread_runner_idle() {
 
             log::info!("[ThreadRunner] AP {} slot {} done", apic_id, slot_idx);
         }
+
         core::hint::spin_loop();
     }
 }
@@ -1815,11 +1837,35 @@ fn run_thread_on_this_cpu(slot_idx: usize) {
         return_value: 0,
     };
 
+    let mut iteration: u64 = 0;
     loop {
-        unsafe {
+        let ap_result = unsafe {
             (*(*this_cpu_unsafe()).ghcb).ap_create(
                 vmsa_paddr, u64::from(apic_id), TRUSTLET_VMPL, sev_features,
-            ).unwrap();
+            )
+        };
+
+        iteration += 1;
+
+        if let Err(ref e) = ap_result {
+            let v_rip = rc.vmsa.rip;
+            let v_exit = rc.vmsa.guest_exit_code;
+            log::error!(
+                "[ThreadRunner] slot {} ap_create FAILED at iter {}: {:?}  rip={:#x} exit_code={:?}",
+                slot_idx, iteration, e, v_rip, v_exit
+            );
+            THREAD_SLOTS[slot_idx].exit_code.store(u64::MAX, AtomicOrdering::Release);
+            return;
+        }
+
+        if iteration <= 3 {
+            let v_rax = rc.vmsa.rax;
+            let v_rip = rc.vmsa.rip;
+            let v_exit = rc.vmsa.guest_exit_code;
+            log::info!(
+                "[ThreadRunner] slot {} iter {}: ap_create returned, rax={:#x} rip={:#x} exit_code={:?}",
+                slot_idx, iteration, v_rax, v_rip, v_exit
+            );
         }
 
         if rc.vmsa.rax == 0x4FFFFFEA {
@@ -1831,7 +1877,13 @@ fn run_thread_on_this_cpu(slot_idx: usize) {
         }
 
         if !rc.handle_process_request() {
-            log::warn!("[ThreadRunner] slot {} terminated unexpectedly", slot_idx);
+            let v_rax = rc.vmsa.rax;
+            let v_rip = rc.vmsa.rip;
+            let v_exit = rc.vmsa.guest_exit_code;
+            log::warn!(
+                "[ThreadRunner] slot {} terminated unexpectedly at iter {}, rax={:#x} rip={:#x} exit_code={:?}",
+                slot_idx, iteration, v_rax, v_rip, v_exit
+            );
             THREAD_SLOTS[slot_idx].exit_code.store(u64::MAX, AtomicOrdering::Release);
             return;
         }

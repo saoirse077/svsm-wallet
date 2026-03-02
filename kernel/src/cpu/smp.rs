@@ -14,11 +14,10 @@ use crate::platform::SVSM_PLATFORM;
 use crate::process_manager::monitor_init;
 use crate::requests::{request_loop, request_processing_main};
 use crate::task::{create_kernel_task, schedule_init};
-use crate::utils::immut_after_init::immut_after_init_set_multithreaded;
-use crate::process_runtime::runtime::{thread_runner_idle, NUM_ACTIVE_RUNNERS};
+use crate::process_runtime::runtime::{thread_runner_idle, NUM_ACTIVE_RUNNERS, MAX_THREAD_RUNNERS};
 use core::sync::atomic::Ordering;
 
-const THREAD_RUNNER_BASE_APIC: u32 = 1;
+pub const THREAD_RUNNER_BASE_APIC: u32 = 1;
 
 fn start_cpu(platform: &dyn SvsmPlatform, apic_id: u32, vtom: u64) {
     let start_rip: u64 = (start_ap as *const u8) as u64;
@@ -56,14 +55,17 @@ fn start_cpu(platform: &dyn SvsmPlatform, apic_id: u32, vtom: u64) {
 }
 
 pub fn start_secondary_cpus(platform: &dyn SvsmPlatform, cpus: &[ACPICPUInfo], vtom: u64) {
-    immut_after_init_set_multithreaded();
     let mut count: usize = 0;
+    let mut runners: usize = 0;
     for c in cpus.iter().filter(|c| c.apic_id != 0 && c.enabled) {
         log::info!("Launching AP with APIC-ID {}", c.apic_id);
         start_cpu(platform, c.apic_id, vtom);
         count += 1;
+        if c.apic_id >= THREAD_RUNNER_BASE_APIC {
+            runners += 1;
+        }
     }
-    let runners = count.min(crate::process_runtime::runtime::MAX_THREAD_RUNNERS);
+    let runners = runners.min(MAX_THREAD_RUNNERS);
     NUM_ACTIVE_RUNNERS.store(runners as u64, Ordering::Release);
     log::info!("Brought {} AP(s) online, {} thread runner(s)", count, runners);
 }

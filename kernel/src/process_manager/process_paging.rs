@@ -276,8 +276,6 @@ macro_rules! check_replace_cow_table {
                 let new_flags = $table[$idx].flags().bits() & !ProcessPageFlags::COPY_ON_WRITE.bits();
                 $table[$idx].set(new_page, ProcessPageFlags::from_bits_truncate(new_flags));
             }
-            // Ensure that the write flags are set
-            // There should never be an imcompatible set of flags given to map_4k_pages
             $table[$idx].0 = PhysAddr::from($table[$idx].0.bits() as u64 | $input_flags.bits());
 
         } else {
@@ -982,7 +980,6 @@ impl ProcessPageTableRef {
 
             let table_flags = ProcessPageFlags::PRESENT | ProcessPageFlags::WRITABLE |
                 ProcessPageFlags::USER_ACCESSIBLE | ProcessPageFlags::ACCESSED;
-
 
             check_replace_cow_table!(pgd_table, pgd_idx, table_flags);
             (_pud_mapping, pud_table) = paddr_as_table!(strip_paddr!(pgd_table[pgd_idx].0));
