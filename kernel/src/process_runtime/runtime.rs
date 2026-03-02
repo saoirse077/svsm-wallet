@@ -176,9 +176,10 @@ pub const MAX_THREAD_RUNNERS: usize = 7;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadSlotState {
     Free = 0,
-    Pending = 1,
-    Running = 2,
-    Done = 3,
+    Reserved = 1,
+    Pending = 2,
+    Running = 3,
+    Done = 4,
 }
 
 pub struct ThreadSlotShared {
@@ -221,7 +222,12 @@ pub static NUM_ACTIVE_RUNNERS: AtomicU64 = AtomicU64::new(0);
 fn find_free_thread_slot() -> Option<usize> {
     let num = NUM_ACTIVE_RUNNERS.load(AtomicOrdering::Acquire) as usize;
     for i in 0..num {
-        if THREAD_SLOTS[i].state.load(AtomicOrdering::Acquire) == ThreadSlotState::Free as u8 {
+        if THREAD_SLOTS[i].state.compare_exchange(
+            ThreadSlotState::Free as u8,
+            ThreadSlotState::Reserved as u8,
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
+        ).is_ok() {
             return Some(i);
         }
     }
@@ -1782,12 +1788,18 @@ fn apic_id_to_slot(apic_id: u32) -> usize {
 /// Guest VMPL2 scheduling is needed here.
 #[no_mangle]
 pub extern "C" fn thread_runner_idle() {
-    // Ensure free page list (PGD[1]) is mapped in the post-schedule_init page table.
-    // monitor_init() in start_ap() writes PGD[1] to the pre-schedule page table,
-    // but schedule_init() switches to a new CR3, so we must re-apply here.
     crate::process_manager::monitor_init();
     let apic_id = this_cpu().get_apic_id();
     let slot_idx = apic_id_to_slot(apic_id);
+
+    if slot_idx >= MAX_THREAD_RUNNERS {
+        log::error!(
+            "[ThreadRunner] AP {} slot_idx {} exceeds MAX_THREAD_RUNNERS ({}), parking",
+            apic_id, slot_idx, MAX_THREAD_RUNNERS
+        );
+        loop { core::hint::spin_loop(); }
+    }
+
     log::info!("[ThreadRunner] AP {} ready, slot {}", apic_id, slot_idx);
 
     loop {
