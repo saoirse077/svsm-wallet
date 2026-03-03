@@ -906,7 +906,7 @@ impl ProcessRuntime for PALContext  {
         let verify_state = THREAD_SLOTS[slot_id].state.load(AtomicOrdering::Acquire);
         self.vmsa.rax = slot_id as u64;
         self.vmsa.rcx = 0;
-        log::info!(
+        log::debug!(
             "[Thread] created slot={} @ {:p}: rip={:#x} rsp={:#x} gs={:#x} arg={:#x} vmsa={:#x} state_verify={}",
             slot_id, slot_ptr, entry_rip, stack_top, gs_base, arg, vmsa_paddr, verify_state
         );
@@ -926,7 +926,7 @@ impl ProcessRuntime for PALContext  {
             return true;
         }
 
-        log::info!("[Thread] joining slot={}", tid);
+        log::debug!("[Thread] joining slot={}", tid);
 
         while THREAD_SLOTS[tid].state.load(AtomicOrdering::Acquire) != ThreadSlotState::Done as u8 {
             core::hint::spin_loop();
@@ -937,7 +937,7 @@ impl ProcessRuntime for PALContext  {
 
         self.vmsa.rax = exit_code;
         self.vmsa.rcx = 0;
-        log::info!("[Thread] join slot={} done, exit_code={}", tid, exit_code);
+        log::debug!("[Thread] join slot={} done, exit_code={}", tid, exit_code);
         true
     }
 
@@ -951,7 +951,7 @@ impl ProcessRuntime for PALContext  {
     fn pal_svsm_query_thread_capacity(&mut self) -> bool {
         let cap = NUM_ACTIVE_RUNNERS.load(AtomicOrdering::Acquire);
         self.vmsa.rax = cap;
-        log::info!("[Thread] query_capacity: {}", cap);
+        log::debug!("[Thread] query_capacity: {}", cap);
         true
     }
 
@@ -1807,7 +1807,7 @@ pub extern "C" fn thread_runner_idle() {
 
         if state == ThreadSlotState::Pending as u8 {
             THREAD_SLOTS[slot_idx].state.store(ThreadSlotState::Running as u8, AtomicOrdering::Release);
-            log::info!("[ThreadRunner] AP {} picked up slot {}", apic_id, slot_idx);
+            log::debug!("[ThreadRunner] AP {} picked up slot {}", apic_id, slot_idx);
 
             run_thread_on_this_cpu(slot_idx);
 
@@ -1816,7 +1816,7 @@ pub extern "C" fn thread_runner_idle() {
             THREAD_SLOTS[slot_idx].vmsa_paddr.store(0, AtomicOrdering::Release);
             THREAD_SLOTS[slot_idx].state.store(ThreadSlotState::Done as u8, AtomicOrdering::Release);
 
-            log::info!("[ThreadRunner] AP {} slot {} done", apic_id, slot_idx);
+            log::debug!("[ThreadRunner] AP {} slot {} done", apic_id, slot_idx);
         }
 
         core::hint::spin_loop();
@@ -1874,7 +1874,7 @@ fn run_thread_on_this_cpu(slot_idx: usize) {
             let v_rax = rc.vmsa.rax;
             let v_rip = rc.vmsa.rip;
             let v_exit = rc.vmsa.guest_exit_code;
-            log::info!(
+            log::debug!(
                 "[ThreadRunner] slot {} iter {}: ap_create returned, rax={:#x} rip={:#x} exit_code={:?}",
                 slot_idx, iteration, v_rax, v_rip, v_exit
             );
@@ -1883,7 +1883,7 @@ fn run_thread_on_this_cpu(slot_idx: usize) {
         if rc.vmsa.rax == 0x4FFFFFEA {
             rc.vmsa.rip += 2;
             let exit_code = rc.vmsa.rbx;
-            log::info!("[ThreadRunner] slot {} thread exit, code={}", slot_idx, exit_code);
+            log::debug!("[ThreadRunner] slot {} thread exit, code={}", slot_idx, exit_code);
             THREAD_SLOTS[slot_idx].exit_code.store(exit_code, AtomicOrdering::Release);
             return;
         }
