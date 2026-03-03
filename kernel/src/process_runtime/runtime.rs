@@ -21,9 +21,8 @@ use crate::sev::utils::rmp_set_guest_vmsa;
 use crate::process_manager::process_memory::{PGD, addr_to_idx, free_page};
 use crate::locking::SpinLock;
 
-/// Global lock protecting page table modifications to prevent
-/// concurrent corruption when BSP and AP thread runners modify
-/// the same page table (shared CR3).
+/// 全局页表锁，防止 BSP 和 AP thread runner 并发修改同一页表（共享 CR3）时
+/// 导致页表损坏。
 static PAGE_TABLE_LOCK: SpinLock<()> = SpinLock::new(());
 use crate::process_manager::memory_channels::{INPUT_VADDR, OUTPUT_VADDR};
 
@@ -168,8 +167,8 @@ impl MmapManager {
     }
 }
 
-/// Global shared thread slots for multi-vCPU thread execution.
-/// AP with APIC ID `n` monitors slot `n-1` (APIC 0 is BSP).
+/// 多 vCPU 线程执行的全局共享线程槽。
+/// APIC ID 为 `n` 的 AP 监听槽 `n - THREAD_RUNNER_BASE_APIC`。
 pub const MAX_THREAD_RUNNERS: usize = 7;
 
 #[repr(u8)]
@@ -844,10 +843,10 @@ impl ProcessRuntime for PALContext  {
 
     /* ========== [THREAD] Thread management - 开始 ========== */
 
-    /// Create a thread: allocate VMSA, post to global THREAD_SLOTS for AP pickup.
+    /// 创建线程：分配 VMSA，投递到全局 THREAD_SLOTS 等待 AP 拾取。
     ///
-    /// Registers: rax=0x4FFFFFEC, rbx=entry_rip, rcx=stack_top, rdx=gs_base, r8=arg
-    /// Returns:   rax=slot_id, rcx=0 on success; rax=MAX, rcx!=0 on error
+    /// 寄存器: rax=0x4FFFFFEC, rbx=entry_rip, rcx=stack_top, rdx=gs_base, r8=arg
+    /// 返回:   rax=slot_id, rcx=0 成功; rax=MAX, rcx!=0 失败
     fn pal_svsm_thread_create(&mut self) -> bool {
         let entry_rip = self.vmsa.rbx;
         let stack_top = self.vmsa.rcx;
@@ -877,10 +876,10 @@ impl ProcessRuntime for PALContext  {
         new_vmsa.gs.base = gs_base;
         new_vmsa.rdi    = arg;
 
-        // Clear residual exit state inherited from the parent VMSA.
-        // The parent was in the middle of a CPUID trap when copied;
-        // leaving these fields dirty may confuse the hardware/hypervisor
-        // when ap_create tries to start the new vCPU.
+        // 清除从父 VMSA 继承的残留退出状态。
+        // 父 VMSA 在被拷贝时正处于 CPUID 陷入中途；
+        // 若不清理这些字段，ap_create 启动新 vCPU 时可能导致
+        // 硬件/Hypervisor 行为异常。
         new_vmsa.guest_exit_code = GuestVMExit::INVALID;
         new_vmsa.guest_exitinfo1 = 0;
         new_vmsa.guest_exitinfo2 = 0;
@@ -915,10 +914,10 @@ impl ProcessRuntime for PALContext  {
         true
     }
 
-    /// Join a thread: spin-wait on THREAD_SLOTS until AP sets Done.
+    /// 等待线程结束：在 THREAD_SLOTS 上自旋等待，直到 AP 将状态设为 Done。
     ///
-    /// Registers: rax=0x4FFFFFEB, rbx=slot_id
-    /// Returns:   rax=exit_code, rcx=0 on success
+    /// 寄存器: rax=0x4FFFFFEB, rbx=slot_id
+    /// 返回:   rax=exit_code, rcx=0 成功
     fn pal_svsm_thread_join(&mut self) -> bool {
         let tid = self.vmsa.rbx as usize;
         let num = NUM_ACTIVE_RUNNERS.load(AtomicOrdering::Acquire) as usize;
@@ -943,13 +942,13 @@ impl ProcessRuntime for PALContext  {
         true
     }
 
-    /// Thread exit: intercepted in thread_runner_idle before reaching dispatch.
+    /// 线程退出：在 thread_runner_idle 中拦截，不会到达 dispatch。
     fn pal_svsm_thread_exit(&mut self) -> bool {
         log::warn!("[Thread] thread_exit called outside thread runner context");
         false
     }
 
-    /// Query the number of available thread runners (AP count).
+    /// 查询可用的 thread runner 数量（AP 数）。
     fn pal_svsm_query_thread_capacity(&mut self) -> bool {
         let cap = NUM_ACTIVE_RUNNERS.load(AtomicOrdering::Acquire);
         self.vmsa.rax = cap;
@@ -1776,18 +1775,18 @@ impl ProcessRuntime for PALContext  {
     }
 }
 
-/* ========== Multi-vCPU Thread Runner ========== */
+/* ========== 多 vCPU 线程 Runner ========== */
 
 fn apic_id_to_slot(apic_id: u32) -> usize {
     (apic_id as usize) - (crate::cpu::smp::THREAD_RUNNER_BASE_APIC as usize)
 }
 
-/// AP idle loop: each AP monitors its dedicated THREAD_SLOT.
-/// When a slot transitions to Pending, the AP runs the thread VMSA on this CPU.
+/// AP 空转循环：每个 AP 监听其专属的 THREAD_SLOT。
+/// 当槽位状态转为 Pending 时，AP 在当前 CPU 上运行线程 VMSA。
 ///
-/// ThreadRunner APs are invisible to the Guest OS. The Guest's AP CREATE
-/// requests for these APIC IDs are rejected by `core_create_vcpu`, so no
-/// Guest VMPL2 scheduling is needed here.
+/// ThreadRunner AP 对 Guest OS 不可见。Guest 针对这些 APIC ID 的
+/// AP CREATE 请求会被 `core_create_vcpu` 拒绝，因此此处无需
+/// Guest VMPL2 调度。
 #[no_mangle]
 pub extern "C" fn thread_runner_idle() {
     crate::process_manager::monitor_init();
@@ -1825,7 +1824,7 @@ pub extern "C" fn thread_runner_idle() {
     }
 }
 
-/// Execute a thread VMSA on the current AP. Loops ap_create until THREAD_EXIT.
+/// 在当前 AP 上执行线程 VMSA。循环 ap_create 直到 THREAD_EXIT。
 fn run_thread_on_this_cpu(slot_idx: usize) {
     let vmsa_paddr = PhysAddr::from(THREAD_SLOTS[slot_idx].vmsa_paddr.load(AtomicOrdering::Acquire));
     let mapping = PerCPUPageMappingGuard::create_4k(vmsa_paddr).unwrap();
