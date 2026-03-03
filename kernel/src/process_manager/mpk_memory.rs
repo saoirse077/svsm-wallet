@@ -213,12 +213,12 @@ pub fn mpk_pkey_alloc_only(page_table_cr3: u64) -> Result<u32, u32> {
     let manager = managers
         .entry(page_table_cr3)
         .or_insert_with(|| {
-            log::info!("[MPK] Creating per-process MpkMemoryManager for cr3={:#x}", page_table_cr3);
+            log::debug!("[MPK] Creating per-process MpkMemoryManager for cr3={:#x}", page_table_cr3);
             MpkMemoryManager::new()
         });
 
-    let pkey = manager.pkey_allocator.alloc().ok_or(6u32)?;  // 错误码 6: 无空闲 pkey
-    log::info!("[MPK] mpk_pkey_alloc_only: cr3={:#x}, allocated pkey={}", page_table_cr3, pkey);
+    let pkey = manager.pkey_allocator.alloc().ok_or(6u32)?;
+    log::debug!("[MPK] mpk_pkey_alloc_only: cr3={:#x}, allocated pkey={}", page_table_cr3, pkey);
     Ok(pkey)
 }
 
@@ -249,7 +249,7 @@ pub fn mpk_alloc_memory(page_table_cr3: u64, addr: u64, size: u64, pkey: u32) ->
     let manager = managers
         .entry(page_table_cr3)
         .or_insert_with(|| {
-            log::info!("[MPK] Creating per-process MpkMemoryManager for cr3={:#x} (from alloc_memory)", page_table_cr3);
+            log::debug!("[MPK] Creating per-process MpkMemoryManager for cr3={:#x} (from alloc_memory)", page_table_cr3);
             MpkMemoryManager::new()
         });
 
@@ -274,7 +274,7 @@ pub fn mpk_alloc_memory(page_table_cr3: u64, addr: u64, size: u64, pkey: u32) ->
     // 5. 记录分配信息
     manager.allocations.insert(addr, MpkAllocation { pkey, size });
 
-    log::info!("[MPK] mpk_alloc_memory: cr3={:#x}, addr={:#x}, size={}, pkey={}, pages={}",
+    log::debug!("[MPK] mpk_alloc_memory: cr3={:#x}, addr={:#x}, size={}, pkey={}, pages={}",
                page_table_cr3, addr, size, pkey, page_count);
 
     Ok(())
@@ -355,7 +355,7 @@ pub fn mpk_free_memory(page_table_cr3: u64, addr: u64, size: u64) -> Result<(), 
     // 6. 删除分配记录（不归还 pkey）
     manager.allocations.remove(&addr);
 
-    log::info!("[MPK] mpk_free_memory: cr3={:#x}, addr={:#x}, size={}, pkey={} (pkey retained)",
+    log::debug!("[MPK] mpk_free_memory: cr3={:#x}, addr={:#x}, size={}, pkey={} (pkey retained)",
                page_table_cr3, addr, size, pkey);
 
     Ok(())
@@ -394,7 +394,7 @@ pub fn mpk_free_pkey(pkey: u32, page_table_cr3: u64, addr: u64, size: u64) -> Re
     let mut managers = MPK_MANAGERS.lock();
     if let Some(manager) = managers.get_mut(&page_table_cr3) {
         manager.pkey_allocator.free(pkey);
-        log::info!("[MPK] mpk_free_pkey: cr3={:#x}, pkey={} freed", page_table_cr3, pkey);
+        log::debug!("[MPK] mpk_free_pkey: cr3={:#x}, pkey={} freed", page_table_cr3, pkey);
     } else {
         // 进程的 Manager 不存在，可能已被清理，仍然返回成功
         log::warn!("[MPK] mpk_free_pkey: no manager for cr3={:#x}, pkey={} (ignored)", page_table_cr3, pkey);

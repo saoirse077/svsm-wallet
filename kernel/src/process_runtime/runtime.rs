@@ -668,7 +668,7 @@ impl ProcessRuntime for PALContext  {
             Ok(pkey) => {
                 self.vmsa.rax = pkey as u64;
                 self.vmsa.rcx = 0;
-                log::info!("[MPK] pkey_alloc: cr3={:#x}, pkey={}", page_table_cr3, pkey);
+                log::debug!("[MPK] pkey_alloc: cr3={:#x}, pkey={}", page_table_cr3, pkey);
             }
             Err(e) => {
                 self.vmsa.rcx = e as u64;
@@ -688,17 +688,17 @@ impl ProcessRuntime for PALContext  {
         let pkey = self.vmsa.rdx as u32;
         let page_table_cr3 = self.vmsa.cr3;
 
-        // 页对齐检查
         if addr % 4096 != 0 || size % 4096 != 0 {
             self.vmsa.rcx = 1;
             log::error!("[MPK] alloc failed: addr={:#x}, size={} - not page aligned", addr, size);
             return true;
         }
 
+        let _pt_guard = PAGE_TABLE_LOCK.lock();
         match mpk_alloc_memory(page_table_cr3, addr, size, pkey) {
             Ok(()) => {
                 self.vmsa.rcx = 0;
-                log::info!("[MPK] alloc success: addr={:#x}, size={}, pkey={}", addr, size, pkey);
+                log::debug!("[MPK] alloc success: addr={:#x}, size={}, pkey={}", addr, size, pkey);
             }
             Err(e) => {
                 self.vmsa.rcx = e as u64;
@@ -741,7 +741,7 @@ impl ProcessRuntime for PALContext  {
         let new_pkru = pkru & !(0x3u32 << (pkey * 2));
         self.vmsa.pkru = new_pkru;
         self.vmsa.rcx = 0;
-        log::info!("[MPK] enter_domain: pkey={}, PKRU {:#x} -> {:#x}", pkey, pkru, new_pkru);
+        log::debug!("[MPK] enter_domain: pkey={}, PKRU {:#x} -> {:#x}", pkey, pkru, new_pkru);
         true
     }
 
@@ -763,7 +763,7 @@ impl ProcessRuntime for PALContext  {
         let new_pkru = pkru | (0x1u32 << (pkey * 2));
         self.vmsa.pkru = new_pkru;
         self.vmsa.rcx = 0;
-        log::info!("[MPK] exit_domain: pkey={}, PKRU {:#x} -> {:#x}", pkey, pkru, new_pkru);
+        log::debug!("[MPK] exit_domain: pkey={}, PKRU {:#x} -> {:#x}", pkey, pkru, new_pkru);
         true
     }
 
@@ -782,10 +782,11 @@ impl ProcessRuntime for PALContext  {
             return true;
         }
 
+        let _pt_guard = PAGE_TABLE_LOCK.lock();
         match mpk_free_memory(page_table_cr3, addr, size) {
             Ok(_) => {
                 self.vmsa.rcx = 0;
-                log::info!("[MPK] free_memory success: addr={:#x}, size={}", addr, size);
+                log::debug!("[MPK] free_memory success: addr={:#x}, size={}", addr, size);
             }
             Err(e) => {
                 self.vmsa.rcx = e as u64;
@@ -813,10 +814,11 @@ impl ProcessRuntime for PALContext  {
             }
         }
 
+        let _pt_guard = PAGE_TABLE_LOCK.lock();
         match mpk_free_pkey(pkey, page_table_cr3, addr, size) {
             Ok(_) => {
                 self.vmsa.rcx = 0;
-                log::info!("[MPK] free_pkey: pkey={}, addr={:#x}, size={}", pkey, addr, size);
+                log::debug!("[MPK] free_pkey: pkey={}, addr={:#x}, size={}", pkey, addr, size);
             }
             Err(e) => {
                 self.vmsa.rcx = e as u64;
@@ -834,7 +836,7 @@ impl ProcessRuntime for PALContext  {
         let pkru_val = self.vmsa.pkru;
         self.vmsa.rax = pkru_val as u64;
         self.vmsa.rcx = 0;
-        log::info!("[MPK] query_pkru: PKRU={:#x}", pkru_val);
+        log::debug!("[MPK] query_pkru: PKRU={:#x}", pkru_val);
         true
     }
 
