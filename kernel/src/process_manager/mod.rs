@@ -27,7 +27,7 @@ pub mod mpk_memory;
 
 static MONITOR_INIT_STATE: ImmutAfterInitCell<bool> = ImmutAfterInitCell::new(false);
 const MONITOR_INIT_STATE_TRUE: bool = true;
-pub const PROCESS_STORE_SIZE: u32 = 64;
+pub const PROCESS_STORE_SIZE: u32 = 16;
 
 pub fn monitor_init(){
     if *MONITOR_INIT_STATE {

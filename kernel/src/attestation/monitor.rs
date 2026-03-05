@@ -57,8 +57,8 @@ const KEY_SIZE: usize = 32;
 const NONCE_SIZE: usize = 24;
 
 pub const MONITOR_ATTESTATION: u64 = 0;
-const ZYGOTE_ATTESTATION: u64 = 1;
-const TRUSTLET_ATTESTATION: u64 = 2;
+const WAMR_RUNTIME_ATTESTATION: u64 = 1;    // 原 ZYGOTE_ATTESTATION
+const WASM_MODULE_ATTESTATION: u64 = 2;     // 原 TRUSTLET_ATTESTATION
 const FUNCTION_ATTESTATION: u64 = 3;
 /* helper attestation options for microbenchmarks */
 pub const MONITOR_ATTESTATION_COLD: u64 = 4;
@@ -68,23 +68,27 @@ const PREPARE_TRUSTLET_ATTESTATION_COLD: u64 = 7;
 const TRUSTLET_ATTESTATION_COLD: u64 = 8;
 /* end of helper attestation options for microbenchmarks */
 
+pub const MAX_WASM_MODULES: usize = 2;
+
 #[derive(Debug, Copy, Clone)]
 pub struct ProcessMeasurements {
-    pub init_measurement: [u8; 64],
-    pub manifest_measurement: [u8; 64],
-    pub libos_measurement: [u8; 64],
-    pub function_measurement: [u8; 64],
-    pub input_data: [u8; 64],
-    pub output_data: [u8; 64],
+    pub init_measurement: [u8; 64],                             // WAMR PAL ELF 哈希
+    pub runtime_measurement: [u8; 64],                          // WAMR Runtime 配置哈希
+    pub wasm_module_measurements: [[u8; 64]; MAX_WASM_MODULES], // 每个模块的哈希
+    pub wasm_module_count: usize,                               // 已加载模块数量
+    pub env_hash: [[u8; 64]; MAX_WASM_MODULES],                 // 每个模块的实例化环境哈希
+    pub input_data: [u8; 64],                                   // 输入通道哈希（自动缓存）
+    pub output_data: [u8; 64],                                  // 输出通道哈希（自动缓存）
 }
 
 impl Default for ProcessMeasurements {
     fn default() -> Self {
         return ProcessMeasurements {
             init_measurement: [0; HASH_SIZE],
-            manifest_measurement: [0; HASH_SIZE],
-            libos_measurement: [0; HASH_SIZE],
-            function_measurement: [0; HASH_SIZE],
+            runtime_measurement: [0; HASH_SIZE],
+            wasm_module_measurements: [[0; HASH_SIZE]; MAX_WASM_MODULES],
+            wasm_module_count: 0,
+            env_hash: [[0; HASH_SIZE]; MAX_WASM_MODULES],
             input_data: [0; HASH_SIZE],
             output_data: [0; HASH_SIZE],
         }
@@ -215,21 +219,19 @@ fn monitor_report(params: &mut RequestParams) -> Result<(), SvsmReqError> {
     Ok(())
 }
 
+/// WAMR Runtime 认证 (type=1): SNP + init_measurement + runtime_measurement
 #[allow(non_snake_case)]
-fn zygote_report(params: &mut RequestParams) -> Result<(), SvsmReqError>{
-    let zygote_id = ProcessID(params.r8 as usize);
-    let zygote = PROCESS_STORE.get(zygote_id);
+fn wamr_runtime_report(params: &mut RequestParams) -> Result<(), SvsmReqError>{
+    let process_id = ProcessID(params.r8 as usize);
+    let process = PROCESS_STORE.get(process_id);
 
-    let init_measurement = zygote.measurements.init_measurement;
-    let manifest_measurement = zygote.measurements.manifest_measurement;
-    let libos_measurement = zygote.measurements.libos_measurement;
-    let function_measurement = zygote.measurements.function_measurement;
+    let init_measurement = process.measurements.init_measurement;
+    let runtime_measurement = process.measurements.runtime_measurement;
 
     // Construct the new report
     let mut new_report: Vec<u8> = Vec::new();
 
     if let Some((existing_report, _existing_report_size)) = get_snp_report() {
-        // Copy the existing report data into the new report
         new_report.extend_from_slice(existing_report);
     }
     else {
@@ -239,35 +241,37 @@ fn zygote_report(params: &mut RequestParams) -> Result<(), SvsmReqError>{
 
     // Append the measurements to the new report
     new_report.extend_from_slice(&init_measurement);
-    new_report.extend_from_slice(&manifest_measurement);
-    new_report.extend_from_slice(&libos_measurement);
-    new_report.extend_from_slice(&function_measurement);
+    new_report.extend_from_slice(&runtime_measurement);
 
-    // Now new_report holds the existing report data + measurements
     let new_report_size = new_report.len();
 
-    // Perform the copy_back_report with the new cumulative report
     if params.rcx != 0 {
         copy_back_report(params.rcx, &new_report, new_report_size);
     }
     return Ok(());
 }
 
+/// WASM Module 认证 (type=2): SNP + init + runtime + wasm_module_measurements[module_id]
 #[allow(non_snake_case)]
-fn trustlet_report(params: &mut RequestParams) -> Result<(), SvsmReqError>{
-    let trustlet_id = ProcessID(params.r8 as usize);
-    let trustlet = PROCESS_STORE.get(trustlet_id);
+fn wasm_module_report(params: &mut RequestParams) -> Result<(), SvsmReqError>{
+    let process_id = ProcessID(params.r8 as usize);
+    let module_id = params.r9 as usize;
+    let process = PROCESS_STORE.get(process_id);
 
-    let init_measurement = trustlet.measurements.init_measurement;
-    let manifest_measurement = trustlet.measurements.manifest_measurement;
-    let libos_measurement = trustlet.measurements.libos_measurement;
-    let function_measurement = trustlet.measurements.function_measurement;
+    let init_measurement = process.measurements.init_measurement;
+    let runtime_measurement = process.measurements.runtime_measurement;
+
+    // Validate module_id
+    if module_id >= MAX_WASM_MODULES || module_id >= process.measurements.wasm_module_count {
+        log::info!("Invalid module_id {} (count={})", module_id, process.measurements.wasm_module_count);
+        return Err(SvsmReqError::invalid_parameter());
+    }
+    let wasm_module_measurement = process.measurements.wasm_module_measurements[module_id];
 
     // Construct the new report
     let mut new_report: Vec<u8> = Vec::new();
 
     if let Some((existing_report, _existing_report_size)) = get_snp_report() {
-        // Copy the existing report data into the new report
         new_report.extend_from_slice(existing_report);
     }
     else {
@@ -277,14 +281,11 @@ fn trustlet_report(params: &mut RequestParams) -> Result<(), SvsmReqError>{
 
     // Append the measurements to the new report
     new_report.extend_from_slice(&init_measurement);
-    new_report.extend_from_slice(&manifest_measurement);
-    new_report.extend_from_slice(&libos_measurement);
-    new_report.extend_from_slice(&function_measurement);
+    new_report.extend_from_slice(&runtime_measurement);
+    new_report.extend_from_slice(&wasm_module_measurement);
 
-    // Now new_report holds the existing report data + measurements
     let new_report_size = new_report.len();
 
-    // Perform the copy_back_report with the new cumulative report
     if params.rcx != 0 {
         copy_back_report(params.rcx, &new_report, new_report_size);
     }
@@ -292,6 +293,7 @@ fn trustlet_report(params: &mut RequestParams) -> Result<(), SvsmReqError>{
     return Ok(());
 }
 
+/// 函数执行认证 (type=3): SNP + init + runtime + module + env_hash + input_hash + output_hash + 签名
 #[allow(non_snake_case)]
 fn function_report(params: &mut RequestParams) -> Result<(), SvsmReqError>{
     let guest_pgt = params.r8;
@@ -299,14 +301,17 @@ fn function_report(params: &mut RequestParams) -> Result<(), SvsmReqError>{
     let function_data_addr = params.r9;
     let (function_data, allocation) = ProcessPageTableRef::copy_data_from_guest(function_data_addr, (size).try_into().unwrap(), guest_pgt);
 
-    // Extract the parameters from the struct
+    // Extract the parameters from the updated function_data struct
+    // Layout: trustletId(8) + moduleId(8) + fnInputSize(8) + fnInput(8) + fnOutputSize(8) + fnOutput(8)
     let function_data_struct = vaddr_as_u64_slice!(function_data);
     let trustlet_id = function_data_struct[0];
-    let fn_input_size = function_data_struct[1];
-    let fn_input_addr = function_data_struct[2];
-    let fn_output_size = function_data_struct[3];
-    let fn_output_addr = function_data_struct[4];
-    log::debug!("Extracted values { } { } { } { } { }", trustlet_id, fn_input_size, fn_input_addr, fn_output_size, fn_output_addr);
+    let module_id = function_data_struct[1] as usize;
+    let fn_input_size = function_data_struct[2];
+    let fn_input_addr = function_data_struct[3];
+    let fn_output_size = function_data_struct[4];
+    let fn_output_addr = function_data_struct[5];
+    log::debug!("Extracted values trustlet={} module={} input_size={} input_addr={} output_size={} output_addr={}",
+        trustlet_id, module_id, fn_input_size, fn_input_addr, fn_output_size, fn_output_addr);
 
     allocation.unmount();
     allocation.delete();
@@ -316,9 +321,19 @@ fn function_report(params: &mut RequestParams) -> Result<(), SvsmReqError>{
     let trustlet = PROCESS_STORE.get(trustlet_id);
 
     let init_measurement = trustlet.measurements.init_measurement;
-    let manifest_measurement = trustlet.measurements.manifest_measurement;
-    let libos_measurement = trustlet.measurements.libos_measurement;
-    let function_measurement = trustlet.measurements.function_measurement;
+    let runtime_measurement = trustlet.measurements.runtime_measurement;
+
+    // Validate module_id and get module-specific measurements
+    let wasm_module_measurement = if module_id < MAX_WASM_MODULES && module_id < trustlet.measurements.wasm_module_count {
+        trustlet.measurements.wasm_module_measurements[module_id]
+    } else {
+        [0u8; HASH_SIZE]
+    };
+    let env_hash = if module_id < MAX_WASM_MODULES && module_id < trustlet.measurements.wasm_module_count {
+        trustlet.measurements.env_hash[module_id]
+    } else {
+        [0u8; HASH_SIZE]
+    };
 
     // Get and measure the input data of the function
     let (input_data, allocation) = ProcessPageTableRef::copy_data_from_guest(fn_input_addr, fn_input_size, guest_pgt);
@@ -336,7 +351,6 @@ fn function_report(params: &mut RequestParams) -> Result<(), SvsmReqError>{
     let mut new_report: Vec<u8> = Vec::new();
 
     if let Some((existing_report, _existing_report_size)) = get_snp_report() {
-      // Copy the existing report data into the new report
       new_report.extend_from_slice(existing_report);
     }
     else {
@@ -346,9 +360,9 @@ fn function_report(params: &mut RequestParams) -> Result<(), SvsmReqError>{
 
     // Append the measurements to the new report
     new_report.extend_from_slice(&init_measurement);
-    new_report.extend_from_slice(&manifest_measurement);
-    new_report.extend_from_slice(&libos_measurement);
-    new_report.extend_from_slice(&function_measurement);
+    new_report.extend_from_slice(&runtime_measurement);
+    new_report.extend_from_slice(&wasm_module_measurement);
+    new_report.extend_from_slice(&env_hash);
     new_report.extend_from_slice(&input_hash);
     new_report.extend_from_slice(&output_hash);
 
@@ -374,16 +388,16 @@ pub fn diff_attestation(params: &mut RequestParams) -> Result<(), SvsmReqError>{
             log::debug!("[Performing monitor attestation]");
             let _ = monitor_report(params);
         }
-        ZYGOTE_ATTESTATION => {
-            log::debug!("[Performing zygote {} attestation]", params.r8);
-            let _ = zygote_report(params);
+        WAMR_RUNTIME_ATTESTATION => {
+            log::debug!("[Performing WAMR runtime {} attestation]", params.r8);
+            let _ = wamr_runtime_report(params);
         }
-        TRUSTLET_ATTESTATION => {
-            log::debug!("[Performing trustlet {} attestation]", params.r8);
-            let _ = trustlet_report(params);
+        WASM_MODULE_ATTESTATION => {
+            log::debug!("[Performing WASM module attestation, process={}, module={}]", params.r8, params.r9);
+            let _ = wasm_module_report(params);
         }
         FUNCTION_ATTESTATION => {
-            log::debug!("[Performing function attestation]");
+            log::debug!("[Performing function execution attestation]");
             let _ = function_report(params);
         }
         /* helper attestation options for microbenchmarks */
@@ -598,11 +612,11 @@ fn zygote_report_cold(params: &mut RequestParams) -> Result<(), SvsmReqError>{
     let libos_ptr = TP_LIBOS_START_VADDR;//zygote.base.alloc_range_libos.0;
     let libos_size = zygote.base.alloc_range_libos.1;
 
-    // calculate the measurements
-    let manifest_measurement = measure(manifest_ptr.into(), manifest_size);
-    let libos_measurement = measure(libos_ptr.into(), libos_size);
+    // calculate the measurements (cold: re-measure from memory)
+    let _manifest_measurement = measure(manifest_ptr.into(), manifest_size);
+    let _libos_measurement = measure(libos_ptr.into(), libos_size);
     let init_measurement = measure(init_ptr.into(), init_size);
-    let function_measurement = zygote.measurements.function_measurement;
+    let runtime_measurement = zygote.measurements.runtime_measurement;
 
     // Construct the new report
     let mut new_report: Vec<u8> = Vec::new();
@@ -618,9 +632,7 @@ fn zygote_report_cold(params: &mut RequestParams) -> Result<(), SvsmReqError>{
 
     // Append the measurements to the new report
     new_report.extend_from_slice(&init_measurement);
-    new_report.extend_from_slice(&manifest_measurement);
-    new_report.extend_from_slice(&libos_measurement);
-    new_report.extend_from_slice(&function_measurement);
+    new_report.extend_from_slice(&runtime_measurement);
 
     // Now new_report holds the existing report data + measurements
     let new_report_size = new_report.len();
@@ -667,9 +679,8 @@ fn trustlet_report_cold(params: &mut RequestParams) -> Result<(), SvsmReqError>{
     let function_size = trustlet.base.alloc_range_function.1;
 
     let init_measurement = trustlet.measurements.init_measurement;
-    let manifest_measurement = trustlet.measurements.manifest_measurement;
-    let libos_measurement = trustlet.measurements.libos_measurement;
-    let function_measurement = measure(function_ptr.into(), function_size);
+    let runtime_measurement = trustlet.measurements.runtime_measurement;
+    let _function_measurement_cold = measure(function_ptr.into(), function_size);
 
     // Construct the new report
     let mut new_report: Vec<u8> = Vec::new();
@@ -685,9 +696,8 @@ fn trustlet_report_cold(params: &mut RequestParams) -> Result<(), SvsmReqError>{
 
     // Append the measurements to the new report
     new_report.extend_from_slice(&init_measurement);
-    new_report.extend_from_slice(&manifest_measurement);
-    new_report.extend_from_slice(&libos_measurement);
-    new_report.extend_from_slice(&function_measurement);
+    new_report.extend_from_slice(&runtime_measurement);
+    new_report.extend_from_slice(&_function_measurement_cold);
 
     // Now new_report holds the existing report data + measurements
     let new_report_size = new_report.len();

@@ -19,6 +19,8 @@ use crate::sev::RMPFlags;
 use crate::sev::rmp_adjust;
 use crate::process_manager::process_memory::{PGD, addr_to_idx};
 use crate::process_manager::memory_channels::{INPUT_VADDR, OUTPUT_VADDR};
+use crate::process_manager::process_memory::ALLOCATION_RANGE_VIRT_START;
+use crate::attestation::monitor::{measure, MAX_WASM_MODULES};
 
 // [MPK-DEV] MPK 六接口内存管理模块导入
 use crate::process_manager::mpk_memory::{
@@ -268,8 +270,31 @@ pub fn invoke_trustlet(params: &mut RequestParams) -> Result<(), SvsmReqError> {
             #[cfg(not(feature = "boottime"))]
             {
             breakdown_outb(190);
+            // 保留原有的 input_data 度量（整个输入通道的 SHA-512）
             trustlet.measurements.input_data = trustlet.context.channel.measure_input();
             breakdown_outb(191);
+
+            // Phase 4: 新增 WASM 模块度量
+            // 再次 mount 输入通道，解析 Phase 3b 协议 header，如果 wasm_size > 0 则度量 WASM 字节码
+            trustlet.context.channel.input.mount();
+            let input_base = ALLOCATION_RANGE_VIRT_START as *const u8;
+            let wasm_size = unsafe { *(input_base as *const u32) } as u64;
+            if wasm_size > 0 {
+                let func_name_len = unsafe { *(input_base.add(4) as *const u32) } as u64;
+                let argc = unsafe { *(input_base.add(8) as *const u16) } as u64;
+                let mut offset = 12u64 + func_name_len;
+                offset = (offset + 3) & !3; // align to 4
+                offset += argc * 4;         // skip argv
+                // 对 wasm_bytes 部分做 SHA-512
+                let wasm_hash = measure(ALLOCATION_RANGE_VIRT_START + offset, wasm_size);
+                let idx = trustlet.measurements.wasm_module_count;
+                if idx < MAX_WASM_MODULES {
+                    trustlet.measurements.wasm_module_measurements[idx] = wasm_hash;
+                    trustlet.measurements.wasm_module_count += 1;
+                    log::debug!("[Phase4] WASM module {} measured, hash={:?}", idx, &wasm_hash[..8]);
+                }
+            }
+            trustlet.context.channel.input.unmount();
             }
             breakdown_outb(213);
         } TrustletInvocationType::FILEATTR | TrustletInvocationType::OPEN | TrustletInvocationType::READ => {
@@ -806,6 +831,26 @@ impl ProcessRuntime for PALContext  {
     /// Copies the reuslts into the provided buffer
     fn pal_svsm_get_result(&mut self) -> bool {
         breakdown_outb(220);
+
+        // Phase 4: 在 copy_out 之前，先从输出通道偏移 8 处读取 env_hash（由 VMPL-1 写入）
+        #[cfg(not(feature = "boottime"))]
+        {
+        self.process.context.channel.output.mount();
+        let env_hash_ptr = unsafe {
+            core::slice::from_raw_parts(
+                (ALLOCATION_RANGE_VIRT_START + 8) as *const u8, 64
+            )
+        };
+        let module_idx = if self.process.measurements.wasm_module_count > 0 {
+            self.process.measurements.wasm_module_count - 1
+        } else { 0 };
+        if module_idx < MAX_WASM_MODULES {
+            self.process.measurements.env_hash[module_idx].copy_from_slice(env_hash_ptr);
+            log::debug!("[Phase4] env_hash[{}] read from output channel", module_idx);
+        }
+        self.process.context.channel.output.unmount();
+        }
+
         self.process.context.channel.copy_out(
             self.result_addr,
             self.guest_page_table,

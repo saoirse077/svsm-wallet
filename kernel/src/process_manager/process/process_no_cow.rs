@@ -20,7 +20,7 @@ use cpuarch::vmsa::VMSA;
 use core::mem::replace;
 
 use crate::process_manager::process_paging::TP_STACK_START_VADDR;
-use crate::attestation::monitor::{ProcessMeasurements, measure};
+use crate::attestation::monitor::{ProcessMeasurements, measure, MAX_WASM_MODULES};
 
 use crate::process_manager::exception_handling::*;
 use crate::process_manager::outb::{breakdown_outb};
@@ -65,21 +65,20 @@ impl TrustedProcess {
         log::debug!("manifest_range {:?}", manifest_range);
         base.add_manifest(manifest_data, manifest_size, manifest_range);
         breakdown_outb(198);
-        measurements.manifest_measurement = measure(manifest_data.into(), manifest_size);
+        // Phase 4: manifest 对应 WAMR Runtime 配置，存入 runtime_measurement
+        measurements.runtime_measurement = measure(manifest_data.into(), manifest_size);
         breakdown_outb(199);
         manifest_range.unmount();
         manifest_range.delete();
-        log::debug!("TODO: Compare with manifest measurement of the policy");
+        log::debug!("TODO: Compare with runtime measurement of the policy");
 
         let (libos_data, libos_range) = ProcessPageTableRef::copy_data_from_guest(libos, libos_size, pgt);
         log::debug!("libos_range {:?}", libos_range);
         base.add_libos(libos_data, libos_size, libos_range);
-        breakdown_outb(198);
-        measurements.libos_measurement = measure(libos_data.into(), libos_size);
-        breakdown_outb(199);
+        // Phase 4: libos 在 WAMR 架构中不再使用，跳过度量
         libos_range.unmount();
         libos_range.delete();
-        log::debug!("TODO: Compare with libos measurement of the policy");
+        log::debug!("libos loaded but not measured (WAMR architecture)");
         breakdown_outb(201);
         breakdown_outb(202);
         Self {
@@ -104,9 +103,8 @@ impl TrustedProcess {
             trustlet.base.alloc_range_function.0 = function_code_range.0;
             trustlet.base.alloc_range_function.1 = size;
 
-            log::debug!("Measuring trustlet function");
-            trustlet.measurements.function_measurement = measure(function_code.into(), size);
-            log::debug!("TODO: Compare with function measurement of the policy");
+            // Phase 4: WASM 模块度量移至 runtime.rs invoke_trustlet NORMAL 路径
+            log::debug!("Trustlet function loaded, WASM module measurement deferred to invoke_trustlet");
 
             log::debug!("Adding trustlet function");
             let size = (4096 - (size & 0xFFF)) + size;
