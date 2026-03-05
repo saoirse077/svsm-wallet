@@ -62,10 +62,9 @@ const WASM_MODULE_ATTESTATION: u64 = 2;     // 原 TRUSTLET_ATTESTATION
 const FUNCTION_ATTESTATION: u64 = 3;
 /* helper attestation options for microbenchmarks */
 pub const MONITOR_ATTESTATION_COLD: u64 = 4;
-const PREPARE_ZYGOTE_ATTESTATION_COLD: u64 = 5;
-const ZYGOTE_ATTESTATION_COLD: u64 = 6;
-const PREPARE_TRUSTLET_ATTESTATION_COLD: u64 = 7;
-const TRUSTLET_ATTESTATION_COLD: u64 = 8;
+const PREPARE_WAMR_RUNTIME_ATTESTATION_COLD: u64 = 5;
+const WAMR_RUNTIME_ATTESTATION_COLD: u64 = 6;
+const WASM_MODULE_ATTESTATION_COLD: u64 = 7;
 /* end of helper attestation options for microbenchmarks */
 
 pub const MAX_WASM_MODULES: usize = 15;
@@ -405,21 +404,17 @@ pub fn diff_attestation(params: &mut RequestParams) -> Result<(), SvsmReqError>{
             log::debug!("[Performing monitor cold report generation]");
             let _ = monitor_report_cold(params);
         }
-        PREPARE_ZYGOTE_ATTESTATION_COLD => {
-            log::debug!("[Preparing zygote {} cold report generation]", params.r8);
-            let _ = prepare_zygote_report_cold(params);
+        PREPARE_WAMR_RUNTIME_ATTESTATION_COLD => {
+            log::debug!("[Preparing WAMR runtime {} cold report generation]", params.r8);
+            let _ = prepare_wamr_runtime_report_cold(params);
         }
-        ZYGOTE_ATTESTATION_COLD => {
-            log::debug!("[Performing zygote {} cold report generation]", params.r8);
-            let _ = zygote_report_cold(params);
+        WAMR_RUNTIME_ATTESTATION_COLD => {
+            log::debug!("[Performing WAMR runtime {} cold report generation]", params.r8);
+            let _ = wamr_runtime_report_cold(params);
         }
-        PREPARE_TRUSTLET_ATTESTATION_COLD => {
-            log::debug!("[Preparing trustlet {} cold report generation]", params.r8);
-            let _ = prepare_trustlet_report_cold(params);
-        }
-        TRUSTLET_ATTESTATION_COLD => {
-            log::debug!("[Performing trustlet {} cold report generation]", params.r8);
-            let _ = trustlet_report_cold(params);
+        WASM_MODULE_ATTESTATION_COLD => {
+            log::debug!("[Performing WASM module cold report generation, process={}, module={}]", params.r8, params.r9);
+            let _ = wasm_module_report_cold(params);
         }
         /* end of helper attestation options for microbenchmarks */
         _ => {
@@ -559,7 +554,7 @@ fn monitor_report_cold(params: &mut RequestParams) -> Result<(), SvsmReqError> {
 }
 
 #[allow(non_snake_case)]
-fn prepare_zygote_report_cold(params: &mut RequestParams) -> Result<(), SvsmReqError>{
+fn prepare_wamr_runtime_report_cold(params: &mut RequestParams) -> Result<(), SvsmReqError>{
     let zygote_id = ProcessID(params.r8 as usize);
     let zygote = PROCESS_STORE.get(zygote_id);
 
@@ -601,7 +596,7 @@ fn prepare_zygote_report_cold(params: &mut RequestParams) -> Result<(), SvsmReqE
 }
 
 #[allow(non_snake_case)]
-fn zygote_report_cold(params: &mut RequestParams) -> Result<(), SvsmReqError>{
+fn wamr_runtime_report_cold(params: &mut RequestParams) -> Result<(), SvsmReqError>{
     let zygote_id = ProcessID(params.r8 as usize);
     let zygote = PROCESS_STORE.get(zygote_id);
 
@@ -645,48 +640,38 @@ fn zygote_report_cold(params: &mut RequestParams) -> Result<(), SvsmReqError>{
     return Ok(());
 }
 
+/// WASM Module 冷启动认证: mount 输入通道，重新解析 header 并度量 WASM 字节码
 #[allow(non_snake_case)]
-fn prepare_trustlet_report_cold(params: &mut RequestParams) -> Result<(), SvsmReqError>{
+fn wasm_module_report_cold(params: &mut RequestParams) -> Result<(), SvsmReqError>{
     let trustlet_id = ProcessID(params.r8 as usize);
+    let module_id = params.r9 as usize;
     let trustlet = PROCESS_STORE.get(trustlet_id);
-
-    let function_ptr = TP_FUNCTION_START_VADDR;
-
-    // Getting the monitor page table ref
-    let monitor_cr3 = read_cr3().bits() as u64;
-    let monitor_cr3_mapping = PerCPUPageMappingGuard::create_4k(PhysAddr::from(monitor_cr3)).unwrap();
-    let monitor_pgd_table = vaddr_as_u64_slice!(monitor_cr3_mapping.virt_addr());
-
-    // Getting the trustlet page table ref
-    let trustlet_cr3 = trustlet.context.page_table_ref.process_page_table;
-    let trustlet_cr3_mapping = PerCPUPageMappingGuard::create_4k(PhysAddr::from(trustlet_cr3)).unwrap();
-    let trustlet_pgd_table = vaddr_as_u64_slice!(trustlet_cr3_mapping.virt_addr());
-
-    let monitor_function_pgd_idx = addr_to_idx(function_ptr as usize, PGD);
-    let trustlet_function_pgd_idx = addr_to_idx(function_ptr as usize, PGD);
-
-    monitor_pgd_table[monitor_function_pgd_idx] = trustlet_pgd_table[trustlet_function_pgd_idx];
-
-    return Ok(());
-}
-
-#[allow(non_snake_case)]
-fn trustlet_report_cold(params: &mut RequestParams) -> Result<(), SvsmReqError>{
-    let trustlet_id = ProcessID(params.r8 as usize);
-    let trustlet = PROCESS_STORE.get(trustlet_id);
-
-    let function_ptr = TP_FUNCTION_START_VADDR;
-    let function_size = trustlet.base.alloc_range_function.1;
 
     let init_measurement = trustlet.measurements.init_measurement;
     let runtime_measurement = trustlet.measurements.runtime_measurement;
-    let _function_measurement_cold = measure(function_ptr.into(), function_size);
 
-    // Construct the new report
+    // Cold: mount input channel, re-parse Phase 3b header, re-measure WASM bytecode
+    trustlet.context.channel.input.mount();
+    let input_base = ALLOCATION_RANGE_VIRT_START as *const u8;
+    let wasm_size = unsafe { *(input_base as *const u32) } as u64;
+    let wasm_module_measurement = if wasm_size > 0 {
+        // Parse header to calculate offset (same logic as runtime.rs invoke_trustlet)
+        let func_name_len = unsafe { *(input_base.add(4) as *const u32) } as u64;
+        let argc = unsafe { *(input_base.add(8) as *const u16) } as u64;
+        let mut offset = 12u64 + func_name_len;
+        offset = (offset + 3) & !3; // align to 4
+        offset += argc * 4;         // skip argv
+        // SHA-512 over wasm_bytes
+        measure(ALLOCATION_RANGE_VIRT_START + offset, wasm_size)
+    } else {
+        [0u8; HASH_SIZE]
+    };
+    trustlet.context.channel.input.unmount();
+
+    // Construct the new report: SNP + init + runtime + wasm_module
     let mut new_report: Vec<u8> = Vec::new();
 
     if let Some((existing_report, _existing_report_size)) = get_snp_report() {
-        // Copy the existing report data into the new report
         new_report.extend_from_slice(existing_report);
     }
     else {
@@ -697,12 +682,10 @@ fn trustlet_report_cold(params: &mut RequestParams) -> Result<(), SvsmReqError>{
     // Append the measurements to the new report
     new_report.extend_from_slice(&init_measurement);
     new_report.extend_from_slice(&runtime_measurement);
-    new_report.extend_from_slice(&_function_measurement_cold);
+    new_report.extend_from_slice(&wasm_module_measurement);
 
-    // Now new_report holds the existing report data + measurements
     let new_report_size = new_report.len();
 
-    // Perform the copy_back_report with the new cumulative report
     if params.rcx != 0 {
         copy_back_report(params.rcx, &new_report, new_report_size);
     }
