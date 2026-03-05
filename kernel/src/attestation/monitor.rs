@@ -68,7 +68,7 @@ const PREPARE_TRUSTLET_ATTESTATION_COLD: u64 = 7;
 const TRUSTLET_ATTESTATION_COLD: u64 = 8;
 /* end of helper attestation options for microbenchmarks */
 
-pub const MAX_WASM_MODULES: usize = 2;
+pub const MAX_WASM_MODULES: usize = 15;
 
 #[derive(Debug, Copy, Clone)]
 pub struct ProcessMeasurements {
