@@ -9,11 +9,18 @@ use core::cell::UnsafeCell;
 use crate::process_manager::allocation::AllocationRange;
 use alloc::vec::Vec;
 use crate::process_runtime::runtime::MmapManager;
+// [NO-TRUSTLET] 以下 import 在 Trustlet Drop 分支禁用后暂时未使用，保留以备后续修复
+#[allow(unused_imports)]
 use crate::process_manager::exception_handling::gdt_trustlet;
+#[allow(unused_imports)]
 use crate::process_manager::process_memory::free_page;
+#[allow(unused_imports)]
 use crate::process_manager::exception_handling::tss_trustlet;
+#[allow(unused_imports)]
 use crate::process_manager::exception_handling::asm_entry_trustlet_pf;
+#[allow(unused_imports)]
 use crate::process_manager::exception_handling::gdt_desc;
+#[allow(unused_imports)]
 use crate::process_manager::exception_handling::idt_trustlet;
 
 #[cfg(not(feature = "no_cow"))]
@@ -66,11 +73,12 @@ impl FromVAddr for VMSA {
 pub enum TrustedProcessType {
     Undefined,
     Zygote,
-    Trustlet,
+    // [NO-TRUSTLET] Trustlet 枚举值已禁用，仅使用 Zygote
+    // Trustlet,
 }
 pub const UNDEFINED_PROCESS: u32 = 0;
 pub const ZYGOTE_PROCESS: u32 = 1;
-pub const TRUSTLET_PROCESS: u32 = 2;
+// [NO-TRUSTLET] pub const TRUSTLET_PROCESS: u32 = 2;
 
 pub static PROCESS_STORE: TrustedProcessStore = TrustedProcessStore::new();
 
@@ -214,27 +222,28 @@ pub fn check_vmsa_ind(new: &VMSA, sev_features: u64, svme_mask: u64, vmpl_level:
         && new.sev_features == sev_features
 }
 
-impl TrustedProcess {
-    fn dublicate(pid: ProcessID) -> TrustedProcess {
-        let process = PROCESS_STORE.get(pid);
-        let base: ProcessBaseContext = process.base;
-        let measurements: ProcessMeasurements = process.measurements;
-        let mut context = ProcessContext::default();
-        context.init(base, measurements, process.context);
-
-        TrustedProcess {
-            process_type: TrustedProcessType::Trustlet,
-            id: 0,
-            parent_id: pid.0 as u64, // set the id of the parent zygote
-            base,
-            measurements,
-            context,
-            mmap_manager: MmapManager::new(),
-            pf_target_vaddr: 0,
-        }
-
-    }
-}
+// [NO-TRUSTLET] dublicate() 函数已禁用 — Trustlet 创建的核心 CoW 逻辑不再需要
+// impl TrustedProcess {
+//     fn dublicate(pid: ProcessID) -> TrustedProcess {
+//         let process = PROCESS_STORE.get(pid);
+//         let base: ProcessBaseContext = process.base;
+//         let measurements: ProcessMeasurements = process.measurements;
+//         let mut context = ProcessContext::default();
+//         context.init(base, measurements, process.context);
+//
+//         TrustedProcess {
+//             process_type: TrustedProcessType::Trustlet,
+//             id: 0,
+//             parent_id: pid.0 as u64, // set the id of the parent zygote
+//             base,
+//             measurements,
+//             context,
+//             mmap_manager: MmapManager::new(),
+//             pf_target_vaddr: 0,
+//         }
+//
+//     }
+// }
 
 impl Drop for TrustedProcess {
     fn drop(&mut self) {
@@ -242,20 +251,24 @@ impl Drop for TrustedProcess {
             TrustedProcessType::Undefined => {}
             TrustedProcessType::Zygote => {
                 self.base.page_table_ref.delete(&[]);
-                // self.context is empty for zygotes
+                // [NO-TRUSTLET] 注意: 在 CoW 模式下 early_init() 为 Zygote 分配了 VMSA 和 channel，
+                // 此处应释放 VMSA 页和 channel 页，但当前 delete 存在 VMSA RMP 清理 bug，
+                // 且测试脚本不调用 delete()，第一版暂不修复。
+                // TODO: 后续修复 Zygote Drop 中的 VMSA/channel 资源释放
             }
-            TrustedProcessType::Trustlet => {
-                // do not delete self.base as this belongs to the zygote
-                self.context.page_table_ref.delete(&[
-                    idt_trustlet().base_limit().0.into(),
-                    (asm_entry_trustlet_pf as u64).into(),
-                    unsafe { &gdt_desc as *const u8 as u64 }.into(),
-                    tss_trustlet().base().into(),
-                    gdt_trustlet().base_limit().0.into()
-                ]); // nothing else for now
-                free_page(self.context.vmsa);
-                // input and output channels are deleted as part of page_table_ref
-            }
+            // [NO-TRUSTLET] Trustlet 分支已禁用
+            // TrustedProcessType::Trustlet => {
+            //     // do not delete self.base as this belongs to the zygote
+            //     self.context.page_table_ref.delete(&[
+            //         idt_trustlet().base_limit().0.into(),
+            //         (asm_entry_trustlet_pf as u64).into(),
+            //         unsafe { &gdt_desc as *const u8 as u64 }.into(),
+            //         tss_trustlet().base().into(),
+            //         gdt_trustlet().base_limit().0.into()
+            //     ]); // nothing else for now
+            //     free_page(self.context.vmsa);
+            //     // input and output channels are deleted as part of page_table_ref
+            // }
         }
     }
 }

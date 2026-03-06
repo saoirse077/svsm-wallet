@@ -303,6 +303,7 @@ fn function_report(params: &mut RequestParams) -> Result<(), SvsmReqError>{
     // Extract the parameters from the updated function_data struct
     // Layout: trustletId(8) + moduleId(8) + fnInputSize(8) + fnInput(8) + fnOutputSize(8) + fnOutput(8)
     let function_data_struct = vaddr_as_u64_slice!(function_data);
+    // [NO-TRUSTLET] trustlet_id 现在实际是 zygote_id（process_id）
     let trustlet_id = function_data_struct[0];
     let module_id = function_data_struct[1] as usize;
     let fn_input_size = function_data_struct[2];
@@ -643,6 +644,7 @@ fn wamr_runtime_report_cold(params: &mut RequestParams) -> Result<(), SvsmReqErr
 /// WASM Module 冷启动认证: mount 输入通道，重新解析 header 并度量 WASM 字节码
 #[allow(non_snake_case)]
 fn wasm_module_report_cold(params: &mut RequestParams) -> Result<(), SvsmReqError>{
+    // [NO-TRUSTLET] trustlet_id 现在实际是 zygote_id（process_id）
     let trustlet_id = ProcessID(params.r8 as usize);
     let module_id = params.r9 as usize;
     let trustlet = PROCESS_STORE.get(trustlet_id);

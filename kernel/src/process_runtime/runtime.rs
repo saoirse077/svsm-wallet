@@ -209,7 +209,8 @@ pub fn early_invoke(zygote: &'static mut TrustedProcess) {
 
 pub fn invoke_trustlet(params: &mut RequestParams) -> Result<(), SvsmReqError> {
 
-    log::debug!("Invoking Trustlet");
+    // [NO-TRUSTLET] 现在 invoke_trustlet 直接使用 Zygote ID
+    log::debug!("Invoking Process (zygote_id={})", params.rcx);
 
     let id = params.rcx;
 

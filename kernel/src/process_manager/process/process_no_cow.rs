@@ -1,27 +1,44 @@
+// [NO-TRUSTLET] 部分 import 在 Trustlet 代码禁用后暂时未使用，保留以备恢复
+#[allow(unused_imports)]
 use crate::cpu::percpu::this_cpu_shared;
+#[allow(unused_imports)]
 use crate::mm::PAGE_SIZE;
+#[allow(unused_imports)]
 use crate::mm::SVSM_PERCPU_VMSA_BASE;
 use crate::process_manager::process_memory;
+#[allow(unused_imports)]
 use crate::process_manager::PROCESS_STORE_SIZE;
+#[allow(unused_imports)]
 use crate::process_manager::process_memory::allocate_page;
 use crate::process_manager::process_paging::ProcessPageTableRef;
 use crate::process_runtime::runtime::MmapManager;
+#[allow(unused_imports)]
 use crate::protocols::errors::SvsmResultCode;
 use crate::protocols::errors::SvsmReqError;
 use crate::protocols::RequestParams;
+#[allow(unused_imports)]
 use crate::sev::RMPFlags;
+#[allow(unused_imports)]
 use crate::sev::rmp_adjust;
+#[allow(unused_imports)]
 use crate::types::PageSize;
+#[allow(unused_imports)]
 use crate::mm::PerCPUPageMappingGuard;
+#[allow(unused_imports)]
 use crate::sev::utils::rmp_set_guest_vmsa;
 use crate::vaddr_as_u64_slice;
 use super::*;
+#[allow(unused_imports)]
 use cpuarch::vmsa::VMSA;
+#[allow(unused_imports)]
 use core::mem::replace;
 
+#[allow(unused_imports)]
 use crate::process_manager::process_paging::TP_STACK_START_VADDR;
+#[allow(unused_imports)]
 use crate::attestation::monitor::{ProcessMeasurements, measure, MAX_WASM_MODULES};
 
+#[allow(unused_imports)]
 use crate::process_manager::exception_handling::*;
 use crate::process_manager::outb::{breakdown_outb};
 
@@ -93,28 +110,25 @@ impl TrustedProcess {
         }
     }
 
-    pub fn trustlet(parent: ProcessID, data: u64, size: u64, pgt: u64) -> Self{
-        // Inherit the data from the Zygote
-        breakdown_outb(203);
-        let mut trustlet = TrustedProcess::dublicate(parent);
-        breakdown_outb(204);
-        if data != 0 {
-            let (function_code, function_code_range) = ProcessPageTableRef::copy_data_from_guest(data, size, pgt);
-            trustlet.base.alloc_range_function.0 = function_code_range.0;
-            trustlet.base.alloc_range_function.1 = size;
-
-            // Phase 4: WASM 模块度量移至 runtime.rs invoke_trustlet NORMAL 路径
-            log::debug!("Trustlet function loaded, WASM module measurement deferred to invoke_trustlet");
-
-            log::debug!("Adding trustlet function");
-            let size = (4096 - (size & 0xFFF)) + size;
-            trustlet.context.page_table_ref.add_function(function_code, size);
-            function_code_range.unmount();
-            function_code_range.delete();
-            breakdown_outb(205);
-        }
-        trustlet
-    }
+    // [NO-TRUSTLET] trustlet() 函数已禁用 — 不再从 Zygote 派生 Trustlet
+    // pub fn trustlet(parent: ProcessID, data: u64, size: u64, pgt: u64) -> Self{
+    //     breakdown_outb(203);
+    //     let mut trustlet = TrustedProcess::dublicate(parent);
+    //     breakdown_outb(204);
+    //     if data != 0 {
+    //         let (function_code, function_code_range) = ProcessPageTableRef::copy_data_from_guest(data, size, pgt);
+    //         trustlet.base.alloc_range_function.0 = function_code_range.0;
+    //         trustlet.base.alloc_range_function.1 = size;
+    //         log::debug!("Trustlet function loaded, WASM module measurement deferred to invoke_trustlet");
+    //         log::debug!("Adding trustlet function");
+    //         let size = (4096 - (size & 0xFFF)) + size;
+    //         trustlet.context.page_table_ref.add_function(function_code, size);
+    //         function_code_range.unmount();
+    //         function_code_range.delete();
+    //         breakdown_outb(205);
+    //     }
+    //     trustlet
+    // }
 
 }
 
@@ -158,50 +172,40 @@ pub fn create_trusted_process(params: &mut RequestParams, t: TrustedProcessType)
             log::info!("allocated memory after zygote creation: {}", process_memory::allocated_amount());
             Ok(())
         },
-        TrustedProcessType::Trustlet => {
-
-            log::debug!("create_trusted_process(): Creating and registering Trustlet");
-
-            // We get the Zygote ID from the guest
-            // Each Trustlet requires one Zygote
-            let zygote_id = ProcessID(params.r9 as usize);
-
-
-            let trustlet = TrustedProcess::trustlet(zygote_id, process_addr, size, guest_pgt);
-
-            // The creation process might fail
-            if trustlet.process_type == TrustedProcessType::Undefined {
-                params.rcx = u64::from_ne_bytes((-1i64).to_ne_bytes());
-                return Ok(());
-            } 
-
-            let res = PROCESS_STORE.insert(trustlet);
-            params.rcx = u64::from_ne_bytes(res.to_ne_bytes());
-
-            log::info!("allocated memory after trustlet creation: {}", process_memory::allocated_amount());
-            Ok(())
-
-        },
+        // [NO-TRUSTLET] Trustlet 创建分支已禁用
+        // TrustedProcessType::Trustlet => {
+        //     log::debug!("create_trusted_process(): Creating and registering Trustlet");
+        //     let zygote_id = ProcessID(params.r9 as usize);
+        //     let trustlet = TrustedProcess::trustlet(zygote_id, process_addr, size, guest_pgt);
+        //     if trustlet.process_type == TrustedProcessType::Undefined {
+        //         params.rcx = u64::from_ne_bytes((-1i64).to_ne_bytes());
+        //         return Ok(());
+        //     }
+        //     let res = PROCESS_STORE.insert(trustlet);
+        //     params.rcx = u64::from_ne_bytes(res.to_ne_bytes());
+        //     log::info!("allocated memory after trustlet creation: {}", process_memory::allocated_amount());
+        //     Ok(())
+        // },
     }
 }
 
 pub fn delete_trusted_process(params: &mut RequestParams) -> Result<(), SvsmReqError> {
     let process_id = ProcessID(params.rcx as usize);
-    let process = PROCESS_STORE.get(process_id);
-
-    if process.process_type == TrustedProcessType::Zygote {
-        for i in 0..PROCESS_STORE_SIZE {
-            if i as usize == process_id.0 {
-                continue;
-            }
-            let process = PROCESS_STORE.get(ProcessID(i as usize));
-            if process.process_type == TrustedProcessType::Trustlet {
-                if process.parent_id as usize == process_id.0 {
-                    return Err(SvsmReqError::RequestError(SvsmResultCode::INVALID_PARAMETER));
-                }
-            }
-        }
-    }
+    // [NO-TRUSTLET] 不再需要检查是否有子 Trustlet，直接删除
+    // let process = PROCESS_STORE.get(process_id);
+    // if process.process_type == TrustedProcessType::Zygote {
+    //     for i in 0..PROCESS_STORE_SIZE {
+    //         if i as usize == process_id.0 {
+    //             continue;
+    //         }
+    //         let process = PROCESS_STORE.get(ProcessID(i as usize));
+    //         if process.process_type == TrustedProcessType::Trustlet {
+    //             if process.parent_id as usize == process_id.0 {
+    //                 return Err(SvsmReqError::RequestError(SvsmResultCode::INVALID_PARAMETER));
+    //             }
+    //         }
+    //     }
+    // }
 
     log::info!("allocated memory before deletion of {}: {}", process_id.0, process_memory::allocated_amount());
     PROCESS_STORE.delete(process_id);
@@ -209,60 +213,43 @@ pub fn delete_trusted_process(params: &mut RequestParams) -> Result<(), SvsmReqE
     Ok(())
 }
 
-impl ProcessContext {
-
-    /// This function is called to create a Trustlet from a Zygote
-    pub fn init(&mut self, base: ProcessBaseContext, measurements: ProcessMeasurements, _zygote_context: ProcessContext) {
-
-        // Setup a new page table for the Process
-        let mut new_page_table_ref = ProcessPageTableRef::default();
-        new_page_table_ref.init_vmpl1();
-        new_page_table_ref.copy_from(&base.page_table_ref);
-        let page_table_ref = new_page_table_ref;
-
-        //Creating new VMSA for the Process
-        let new_vmsa_page = allocate_page();
-        let new_vmsa_mapping = PerCPUPageMappingGuard::create_4k(new_vmsa_page).unwrap();
-        let new_vmsa_vaddr = new_vmsa_mapping.virt_addr();
-
-        //Permission Setup for VMSA
-        rmp_adjust(new_vmsa_vaddr, RMPFlags::VMPL1 | RMPFlags::RWX, PageSize::Regular).unwrap();
-        rmp_set_guest_vmsa(new_vmsa_vaddr).unwrap();
-        rmp_adjust(new_vmsa_vaddr, RMPFlags::VMPL1 | RMPFlags::VMSA, PageSize::Regular).unwrap();
-
-        //Guest VMSA -> New VMSA
-        let vmsa = VMSA::from_virt_addr(new_vmsa_vaddr);
-        let locked = this_cpu_shared().guest_vmsa.lock();
-        let old_vmsa_ptr = unsafe { SVSM_PERCPU_VMSA_BASE.as_mut_ptr::<VMSA>().as_mut().unwrap() };
-        _ = replace(vmsa, *old_vmsa_ptr);
-        drop(locked);
-
-        //New VMSA Setup
-        vmsa.vmpl = 1; // Trustlets always run in VMPL1
-        vmsa.cpl = 3; // Ring 3
-        vmsa.cr3 = u64::from(page_table_ref.process_page_table);
-        vmsa.efer = vmsa.efer | 1u64 << 12;
-        vmsa.rip = base.entry_point.into();
-        vmsa.sev_features = old_vmsa_ptr.sev_features | 4; // 4 is for #VC Reflect
-        vmsa.rflags &= !(1u64 << 9); // Clear IF;
-        // New Stack
-        vmsa.rbp = u64::from(TP_STACK_START_VADDR)+8*4096;
-        vmsa.rsp = u64::from(TP_STACK_START_VADDR)+8*4096;
-
-        setup_exceptions(vmsa, &page_table_ref);
-
-        //Memory Channel setup -- No chain setup here
-        let page_table_addr = vmsa.cr3;
-        let mut pptr = ProcessPageTableRef::default();
-        pptr.set_external_table(page_table_addr);
-        self.channel.allocate_input(&mut pptr, PAGE_SIZE);
-        self.channel.allocate_output(&mut pptr, PAGE_SIZE);
-        //pptr.handle_cow(VirtAddr::from(TP_KERN_STACK_START_VADDR), false);
-
-        self.vmsa = new_vmsa_page;
-        self.sev_features = vmsa.sev_features;
-        self.base = base;
-        self.measurements = measurements;
-        self.page_table_ref = page_table_ref;
-    }
-}
+// [NO-TRUSTLET] ProcessContext::init() 已禁用 — Trustlet 的 VMSA/页表初始化不再需要
+// impl ProcessContext {
+//     pub fn init(&mut self, base: ProcessBaseContext, measurements: ProcessMeasurements, _zygote_context: ProcessContext) {
+//         let mut new_page_table_ref = ProcessPageTableRef::default();
+//         new_page_table_ref.init_vmpl1();
+//         new_page_table_ref.copy_from(&base.page_table_ref);
+//         let page_table_ref = new_page_table_ref;
+//         let new_vmsa_page = allocate_page();
+//         let new_vmsa_mapping = PerCPUPageMappingGuard::create_4k(new_vmsa_page).unwrap();
+//         let new_vmsa_vaddr = new_vmsa_mapping.virt_addr();
+//         rmp_adjust(new_vmsa_vaddr, RMPFlags::VMPL1 | RMPFlags::RWX, PageSize::Regular).unwrap();
+//         rmp_set_guest_vmsa(new_vmsa_vaddr).unwrap();
+//         rmp_adjust(new_vmsa_vaddr, RMPFlags::VMPL1 | RMPFlags::VMSA, PageSize::Regular).unwrap();
+//         let vmsa = VMSA::from_virt_addr(new_vmsa_vaddr);
+//         let locked = this_cpu_shared().guest_vmsa.lock();
+//         let old_vmsa_ptr = unsafe { SVSM_PERCPU_VMSA_BASE.as_mut_ptr::<VMSA>().as_mut().unwrap() };
+//         _ = replace(vmsa, *old_vmsa_ptr);
+//         drop(locked);
+//         vmsa.vmpl = 1;
+//         vmsa.cpl = 3;
+//         vmsa.cr3 = u64::from(page_table_ref.process_page_table);
+//         vmsa.efer = vmsa.efer | 1u64 << 12;
+//         vmsa.rip = base.entry_point.into();
+//         vmsa.sev_features = old_vmsa_ptr.sev_features | 4;
+//         vmsa.rflags &= !(1u64 << 9);
+//         vmsa.rbp = u64::from(TP_STACK_START_VADDR)+8*4096;
+//         vmsa.rsp = u64::from(TP_STACK_START_VADDR)+8*4096;
+//         setup_exceptions(vmsa, &page_table_ref);
+//         let page_table_addr = vmsa.cr3;
+//         let mut pptr = ProcessPageTableRef::default();
+//         pptr.set_external_table(page_table_addr);
+//         self.channel.allocate_input(&mut pptr, PAGE_SIZE);
+//         self.channel.allocate_output(&mut pptr, PAGE_SIZE);
+//         self.vmsa = new_vmsa_page;
+//         self.sev_features = vmsa.sev_features;
+//         self.base = base;
+//         self.measurements = measurements;
+//         self.page_table_ref = page_table_ref;
+//     }
+// }

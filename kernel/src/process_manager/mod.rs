@@ -27,6 +27,7 @@ pub mod mpk_memory;
 
 static MONITOR_INIT_STATE: ImmutAfterInitCell<bool> = ImmutAfterInitCell::new(false);
 const MONITOR_INIT_STATE_TRUE: bool = true;
+// [NO-TRUSTLET] 从 16 提升到 32：每个函数只需 1 个 Zygote 槽位（原来需要 2 个）
 pub const PROCESS_STORE_SIZE: u32 = 16;
 
 pub fn monitor_init(){

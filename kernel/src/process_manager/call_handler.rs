@@ -11,8 +11,9 @@ const DIFF_ATTEST: u32 = 2;
 //const LOAD_POLICY: u32 = 3;
 const CREATE_ZYGOTE: u32 = 4;
 const DELETE_ZYGOTE: u32 = 5;
-const CREATE_TRUSTLET: u32 = 6;
-const DELETE_TRUSTLET: u32 = 7;
+// [NO-TRUSTLET] Trustlet 相关常量已禁用
+// const CREATE_TRUSTLET: u32 = 6;
+// const DELETE_TRUSTLET: u32 = 7;
 const INVOKE_TRUSTLET: u32 = 8; 
 const _WAIT_FOR_TRUSTLET_RESULT: u32 = 9;  // unused but defined in vmpl.h
 const CREATE_CHANNEL: u32 = 10;
@@ -71,13 +72,14 @@ fn delete_zygote(params: &mut RequestParams) -> Result<(), SvsmReqError> {
     super::process::delete_trusted_process(params)
 }
 
-fn create_trustlet(params: &mut RequestParams) -> Result<(), SvsmReqError> {
-    super::process::create_trusted_process(params, TrustedProcessType::Trustlet)
-}
-
-fn delete_trustlet(params: &mut RequestParams) -> Result<(), SvsmReqError> {
-    super::process::delete_trusted_process(params)
-}
+// [NO-TRUSTLET] Trustlet handler 函数已禁用
+// fn create_trustlet(params: &mut RequestParams) -> Result<(), SvsmReqError> {
+//     super::process::create_trusted_process(params, TrustedProcessType::Trustlet)
+// }
+//
+// fn delete_trustlet(params: &mut RequestParams) -> Result<(), SvsmReqError> {
+//     super::process::delete_trusted_process(params)
+// }
 
 fn get_public_key(params: &mut RequestParams) -> Result<(), SvsmReqError> {
     attestation::monitor::get_public_key(params)
@@ -102,8 +104,9 @@ pub fn monitor_call_handler(request: u32, params: &mut RequestParams) -> Result<
         DIFF_ATTEST => diff_attestation(params),
         CREATE_ZYGOTE => create_zygote(params),
         DELETE_ZYGOTE => delete_zygote(params),
-        CREATE_TRUSTLET => create_trustlet(params),
-        DELETE_TRUSTLET => delete_trustlet(params),
+        // [NO-TRUSTLET] Trustlet 分支已禁用
+        // CREATE_TRUSTLET => create_trustlet(params),
+        // DELETE_TRUSTLET => delete_trustlet(params),
         GET_PUBLIC_KEY => get_public_key(params),
         SEND_POLICY => send_policy(params),
         INVOKE_TRUSTLET => invoke_trustlet(params),
